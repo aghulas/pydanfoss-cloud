@@ -22,12 +22,14 @@ import os
 import secrets
 import signal
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from .client import CloudClient, CloudError, CloudWriteError
+from .cloud_dp199 import HeadOverlay, decode_dp199
 from .const import (
     MODE_GROUP_SETPOINT_DP,
     SETPOINT_MAX,
@@ -251,7 +253,11 @@ class StandaloneDanfoss2MqttDaemon:
         self._on_bridge_request = on_bridge_request
         self._devices: dict[str, DanfossDevice] = {}
         self._by_friendly: dict[str, DanfossDevice] = {}
+        self._by_node: dict[str, DanfossDevice] = {}
         self._local_attrs: dict[str, dict[str, Any]] = {}
+        # Cloud-MQTT DP 199 overlay, keyed by dev.id. Opportunistic reads decoded from the push
+        # (``cloud_dp199``), layered on top of the HTTP poll baseline and the local-tunnel attrs.
+        self._cloud_overlay: dict[str, HeadOverlay] = {}
 
     @property
     def base_topic(self) -> str:
@@ -286,7 +292,10 @@ class StandaloneDanfoss2MqttDaemon:
 
         descriptors: list[dict[str, Any]] = []
         self._by_friendly.clear()
+        self._by_node.clear()
         for dev in devices:
+            if dev.node_id:
+                self._by_node[dev.node_id] = dev
             if dev.is_head or dev.is_sensor or dev.is_relay:
                 desc = encode_z2m_descriptor(dev)
                 self._by_friendly[desc["friendly_name"]] = dev
@@ -334,16 +343,28 @@ class StandaloneDanfoss2MqttDaemon:
                 self.publish_device(dev)
 
     def publish_device(self, dev: DanfossDevice) -> None:
-        """Publish availability and state for a single ``DanfossDevice``."""
+        """Publish availability and state for a single ``DanfossDevice``.
+
+        The cloud-MQTT DP 199 overlay (``apply_cloud_push``) is layered here, over the polled
+        baseline: its device fields win over the poll, and its decoded attrs are merged with the
+        local-tunnel attrs (tunnel wins on a key present in both — the on-demand reader is
+        authoritative). Nothing is layered for a head with no push yet.
+        """
+        overlay = self._cloud_overlay.get(dev.id)
+        if overlay is not None:
+            dev = overlay.apply_to(dev)
         desc = encode_z2m_descriptor(dev)
         friendly = desc["friendly_name"]
         self._by_friendly[friendly] = dev
+        if dev.node_id:
+            self._by_node[dev.node_id] = dev
         self._transport.publish(
             f"{self._base}/{friendly}/availability",
             AVAIL_ONLINE if dev.online else AVAIL_OFFLINE,
             retain=True,
         )
-        state = encode_z2m_state(dev, local_attrs=self._local_attrs.get(dev.id))
+        local_attrs = self._merged_local_attrs(dev.id, overlay)
+        state = encode_z2m_state(dev, local_attrs=local_attrs)
         if dev.is_relay and not state:
             return
         self._transport.publish(
@@ -351,6 +372,49 @@ class StandaloneDanfoss2MqttDaemon:
             json.dumps(state),
             retain=True,
         )
+
+    def _merged_local_attrs(
+        self, dev_id: str, overlay: HeadOverlay | None
+    ) -> dict[str, Any] | None:
+        """Local-tunnel attrs for ``dev_id`` with the cloud overlay's attrs underneath them.
+
+        The local tunnel is the on-demand reader (fresher by request), so a key it supplies wins
+        over the same key from the opportunistic cloud push. Returns ``None`` when neither source
+        has anything, so ``encode_z2m_state`` adds no tunnel-grade fields.
+        """
+        tunnel_attrs = self._local_attrs.get(dev_id)
+        if overlay is None or not overlay.local_attrs:
+            return tunnel_attrs
+        return {**overlay.local_attrs, **(tunnel_attrs or {})}
+
+    def apply_cloud_push(self, cid: str, dps: dict[str, Any]) -> DanfossDevice | None:
+        """Decode a cloud-MQTT DP 199 push for head ``cid`` and overlay its decoded, dated values.
+
+        ``cid`` is the head's Zigbee node id (``DanfossDevice.node_id``); ``dps`` the report's DP
+        map. A no-op (returns ``None``) unless ``dps`` carries a ``"199"`` that decodes to at least
+        one surfaced attribute for a head this bridge knows. On success the head's read state is
+        overlaid and republished in the Z2M dialect, and the updated device is returned. The
+        HTTP-poll and local-tunnel paths are untouched: this only fills the overlay when a push
+        arrives (the push is opportunistic — DP 199 carries an attribute only when something reads
+        it on the LAN).
+        """
+        if not cid:
+            return None
+        raw = dps.get("199") if isinstance(dps, dict) else None
+        if raw is None:
+            return None
+        dev = self._by_node.get(cid)
+        if dev is None:
+            _LOGGER.debug("danfoss2mqtt: DP 199 push for unknown head %s - ignored", cid)
+            return None
+        decoded = decode_dp199(raw)
+        if decoded is None:
+            return None
+        overlay = self._cloud_overlay.setdefault(dev.id, HeadOverlay())
+        if not overlay.merge(decoded, now=time.time()):
+            return None
+        self.publish_device(dev)
+        return overlay.apply_to(dev)
 
     def _handle_set(self, topic: str, raw_payload: str) -> None:
         if self._on_device_set is None:
