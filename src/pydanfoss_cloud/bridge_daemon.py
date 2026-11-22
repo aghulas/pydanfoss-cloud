@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .client import CloudClient, CloudError
+from .client import CloudClient, CloudError, CloudWriteError
 from .const import (
     MODE_GROUP_SETPOINT_DP,
     SETPOINT_MAX,
@@ -37,7 +37,7 @@ from .const import (
 )
 from .decode import DanfossDevice
 from .mqtt_client import _new_paho_client
-from .rooms import RoomState
+from .rooms import RoomState, aggregate_room
 from .writes import encode_setpoint
 from .z2m_contract import encode_z2m_descriptor, encode_z2m_state
 
@@ -272,8 +272,14 @@ class StandaloneDanfoss2MqttDaemon:
         devices: list[DanfossDevice],
         rooms: list[RoomState] | None = None,
         local_attrs: dict[str, dict[str, Any]] | None = None,
+        holidays: dict[str, Any] | None = None,
     ) -> None:
-        """Publish ``bridge/devices``, ``bridge/rooms``, and all device states to Mosquitto."""
+        """Publish ``bridge/devices``, ``bridge/rooms``, ``bridge/holidays`` and all device states.
+
+        All four topics are retained. ``rooms``/``holidays`` left as ``None`` leave the matching
+        topic untouched this cycle (its retained value stands); an empty list/dict is published as
+        such so the topic appears on the broker.
+        """
         self._devices = {d.id: d for d in devices}
         if local_attrs is not None:
             self._local_attrs = dict(local_attrs)
@@ -298,6 +304,8 @@ class StandaloneDanfoss2MqttDaemon:
                     "group_id": r.group_id,
                     "name": r.name,
                     "pid": r.pid,
+                    "home_id": r.home_gid,
+                    "members": list(r.members),
                     "head_count": r.head_count,
                     "online": r.online,
                     "temperature": r.temperature,
@@ -311,6 +319,13 @@ class StandaloneDanfoss2MqttDaemon:
             self._transport.publish(
                 f"{self._base}/bridge/rooms",
                 json.dumps(rooms_payload),
+                retain=True,
+            )
+
+        if holidays is not None:
+            self._transport.publish(
+                f"{self._base}/bridge/holidays",
+                json.dumps(holidays),
                 retain=True,
             )
 
@@ -416,10 +431,55 @@ _CLOUD_UNSUPPORTED_SET_KEYS = frozenset(
 _CLOUD_IGNORED_SET_KEYS = frozenset({"system_mode"})
 
 
-def _group_setpoint_dps(setpoint_c: float) -> dict[str, int]:
-    """Build the comfort-setpoint group DPs for a ``/set`` ``occupied_heating_setpoint`` (°C)."""
+def _group_setpoint_dps(setpoint_c: float, mode: str | None) -> dict[str, int]:
+    """Build the mode-aware group DPs for a ``/set`` ``occupied_heating_setpoint`` (°C).
+
+    In the Zigbee2MQTT dialect ``occupied_heating_setpoint`` is the head's ACTIVE setpoint, so the
+    write must target the setting of its CURRENT mode/slot, never comfort unconditionally: comfort
+    (DP 118) in ``at_home``, setback (DP 109 + 119) in ``leaving_home``. Mirrors the room climate's
+    ``DanfossClimate.async_set_temperature`` in ha-danfoss-ally ("per current mode"). Raises
+    ``CloudWriteError`` for any other mode, which has no proven path-1a group method, so the caller
+    refuses rather than silently moving the comfort setpoint (real hardware, 2026-11-22: writing it
+    on a head in a setback slot changed comfort while the active setpoint stayed put).
+    """
+    dps_nums = MODE_GROUP_SETPOINT_DP.get(mode or "")
+    if not dps_nums:
+        raise CloudWriteError(
+            "setpoint editable only in comfort (at_home) or setback (leaving_home) mode; "
+            f"current mode: {mode!r}"
+        )
     encoded = encode_setpoint(setpoint_c, SETPOINT_MIN, SETPOINT_MAX, SETPOINT_STEP)
-    return {str(dp): encoded for dp in MODE_GROUP_SETPOINT_DP["at_home"]}
+    return {str(dp): encoded for dp in dps_nums}
+
+
+async def _build_rooms(client: CloudClient, devices: list[DanfossDevice]) -> list[RoomState] | None:
+    """Aggregate the account's rooms (Tuya groups) from the freshly polled ``devices``.
+
+    Returns ``None`` (leave ``bridge/rooms`` untouched this cycle) if the room read fails, so a
+    transient rooms hiccup never loses the device publish. Heads absent from this poll are simply
+    not aggregated; an empty account still yields ``[]`` so the topic is published.
+    """
+    try:
+        groups = await client.async_list_room_groups()
+    except CloudError:
+        _LOGGER.warning("danfoss2mqtt: could not read rooms this cycle", exc_info=True)
+        return None
+    by_id = {d.id: d for d in devices}
+    return [aggregate_room(room, [by_id[m] for m in room.members if m in by_id]) for room in groups]
+
+
+async def _build_holidays(client: CloudClient) -> dict[str, Any] | None:
+    """Per-home holiday state keyed by home gid (``bridge/holidays`` contract §3), or ``None``.
+
+    The Companion ingests ``bridge/holidays`` as a dict ``{gid: {...}}``; ``async_list_holidays``
+    returns a per-home list, remapped here. ``None`` on failure leaves the topic untouched.
+    """
+    try:
+        items = await client.async_list_holidays()
+    except CloudError:
+        _LOGGER.warning("danfoss2mqtt: could not read holidays this cycle", exc_info=True)
+        return None
+    return {str(h["gid"]): h for h in items if h.get("gid") is not None}
 
 
 async def async_run_bridge(
@@ -479,12 +539,13 @@ async def async_run_bridge(
                 )
             else:
                 try:
-                    dps = _group_setpoint_dps(float(raw_setpoint))
+                    dps = _group_setpoint_dps(float(raw_setpoint), dev.mode)
                     group_id = await client.async_set_room_setpoint(dev.id, dps)
                     _LOGGER.info(
-                        "danfoss2mqtt: setpoint %.1f °C written on room %s (head %s)",
+                        "danfoss2mqtt: setpoint %.1f °C written on room %s in %s mode (head %s)",
                         float(raw_setpoint),
                         group_id,
+                        dev.mode,
                         dev.id,
                     )
                     applied = True
@@ -541,7 +602,9 @@ async def async_run_bridge(
         while not stop.is_set():
             try:
                 devices = await client.async_list_devices()
-                daemon.publish_fleet(devices)
+                rooms = await _build_rooms(client, devices)
+                holidays = await _build_holidays(client)
+                daemon.publish_fleet(devices, rooms=rooms, holidays=holidays)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("danfoss2mqtt: poll cycle failed")
 

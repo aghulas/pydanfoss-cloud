@@ -24,6 +24,7 @@ from ._tuya.http import ENDPOINTS, TuyaApiError, TuyaHttpClient, login
 from .const import RES_TYPE_DEVICE, RES_TYPE_GROUP
 from .decode import DanfossDevice, decode_device, holiday_running
 from .messages import MSG_LIST_API, MSG_LIST_VERSION, DanfossMessage, parse_messages
+from .rooms import Room
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -770,6 +771,32 @@ class CloudClient:
             group_id = str(entry.get("id"))
             children = (entry.get("children") or {}).get("6") or []
             out[group_id] = [c.get("id") for c in children if c.get("id")]
+        return out
+
+    async def async_list_room_groups(self) -> list[Room]:
+        """All rooms (Tuya groups, resType 2) of the account's homes, with their member heads.
+
+        Read-only. Combines ``async_list_groups`` (name, pid) and ``async_group_members`` (member
+        devIds) home by home into ``Room`` objects, the source for the ``danfoss2mqtt/bridge/rooms``
+        contract (``docs/companion-contract.md`` §3). A head is driven through its GROUP (shared
+        schedule and setpoints), so the room is the unit the Companion operates on.
+        """
+        out: list[Room] = []
+        for home in await self.async_get_homes():
+            gid = home["gid"]
+            groups = await self.async_list_groups(gid)
+            members = await self.async_group_members(gid)
+            for g in groups:
+                group_id = str(g["group_id"])
+                out.append(
+                    Room(
+                        group_id=group_id,
+                        name=g.get("name") or group_id,
+                        pid=g.get("pid"),
+                        home_gid=str(gid),
+                        members=tuple(members.get(group_id, [])),
+                    )
+                )
         return out
 
     async def async_resolve_group(self, dev_id: str) -> tuple[str, str | None] | None:

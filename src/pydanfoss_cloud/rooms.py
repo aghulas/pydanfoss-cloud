@@ -46,6 +46,11 @@ class RoomState:
     heating: bool | None = None
     min_setpoint: float | None = None
     max_setpoint: float | None = None
+    # Identity carried through for the ``bridge/rooms`` contract (companion-contract.md §3): the
+    # home the group belongs to and its member head ids, which the Companion matches against its
+    # own device map to resolve the room's heads.
+    home_gid: str | None = None
+    members: tuple[str, ...] = ()
 
 
 def aggregate_room(room: Room, members: list[DanfossDevice]) -> RoomState:
@@ -71,4 +76,6 @@ def aggregate_room(room: Room, members: list[DanfossDevice]) -> RoomState:
         heating=heating,
         min_setpoint=ref.min_setpoint if ref else None,
         max_setpoint=ref.max_setpoint if ref else None,
+        home_gid=room.home_gid,
+        members=room.members,
     )
