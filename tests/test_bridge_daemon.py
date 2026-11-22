@@ -17,6 +17,9 @@ from pydanfoss_cloud.bridge_daemon import (
     AVAIL_ONLINE,
     BridgeConfig,
     PahoMqttTransport,
+    StandaloneDanfoss2MqttDaemon,
+    _build_holidays,
+    _build_rooms,
     _group_setpoint_dps,
     _topic_matches,
     async_run_bridge,
@@ -24,7 +27,9 @@ from pydanfoss_cloud.bridge_daemon import (
     load_bridge_config,
     main,
 )
+from pydanfoss_cloud.client import CloudError, CloudWriteError
 from pydanfoss_cloud.decode import DanfossDevice
+from pydanfoss_cloud.rooms import Room, RoomState
 
 
 class _FakePahoClient:
@@ -236,6 +241,20 @@ async def test_async_run_bridge_poll_set_refresh_and_shutdown() -> None:
 
     fake_client = SimpleNamespace(
         async_list_devices=AsyncMock(return_value=[_head()]),
+        async_list_room_groups=AsyncMock(
+            return_value=[
+                Room(
+                    group_id="grp1",
+                    name="Salle 101",
+                    pid="pidX",
+                    home_gid="home9",
+                    members=("dev_1",),
+                )
+            ]
+        ),
+        async_list_holidays=AsyncMock(
+            return_value=[{"gid": "home9", "name": "Maison", "active": False, "scheduled": False}]
+        ),
         async_set_room_setpoint=AsyncMock(return_value="grp1"),
         async_close=AsyncMock(return_value=None),
     )
@@ -256,6 +275,33 @@ async def test_async_run_bridge_poll_set_refresh_and_shutdown() -> None:
     # First poll published bridge/state=online, bridge/devices, and Salle 101 state
     assert ("danfoss2mqtt/bridge/state", AVAIL_ONLINE, True) in published
     assert any(t == "danfoss2mqtt/bridge/devices" for t, _, _ in published)
+
+    # Fix #2: bridge/rooms is published retained, carrying home_id + members (contract §3)
+    rooms_pub = [p for t, p, retain in published if t == "danfoss2mqtt/bridge/rooms" and retain]
+    assert rooms_pub, "bridge/rooms must be published"
+    rooms_json = json.loads(rooms_pub[-1])
+    assert rooms_json == [
+        {
+            "group_id": "grp1",
+            "name": "Salle 101",
+            "pid": "pidX",
+            "home_id": "home9",
+            "members": ["dev_1"],
+            "head_count": 1,
+            "online": True,
+            "temperature": 20.5,
+            "setpoint": 21.0,
+            "setpoints": {},
+            "mode": "at_home",
+            "heating": True,
+        }
+    ]
+    # Fix #2: bridge/holidays is published retained, keyed by home gid
+    hol_pub = [p for t, p, retain in published if t == "danfoss2mqtt/bridge/holidays" and retain]
+    assert hol_pub, "bridge/holidays must be published"
+    assert json.loads(hol_pub[-1]) == {
+        "home9": {"gid": "home9", "name": "Maison", "active": False, "scheduled": False}
+    }
 
     # A setpoint /set goes through the proven room path and triggers an immediate re-poll
     subs["danfoss2mqtt/+/set"](
@@ -307,10 +353,146 @@ async def test_async_run_bridge_requires_credentials_without_client() -> None:
         await async_run_bridge(BridgeConfig(), transport=_NoopTransport())
 
 
-def test_group_setpoint_dps() -> None:
-    # Comfort setpoint (DP 118) in tenths of °C, rounded to the 0.5 °C step.
-    assert _group_setpoint_dps(20.5) == {"118": 205}
-    assert _group_setpoint_dps(21.0) == {"118": 210}
+def test_group_setpoint_dps_is_mode_aware() -> None:
+    # Comfort slot (at_home): DP 118 in tenths of °C, rounded to the 0.5 °C step.
+    assert _group_setpoint_dps(20.5, "at_home") == {"118": 205}
+    assert _group_setpoint_dps(21.0, "at_home") == {"118": 210}
+    # Setback slot (leaving_home): DP 109 AND DP 119, never comfort.
+    assert _group_setpoint_dps(15.0, "leaving_home") == {"109": 150, "119": 150}
+    # Any other mode (or none) has no proven path-1a group method: refuse, don't write comfort.
+    for mode in ("manual", "pause", "holiday", "holiday_sat", None):
+        with pytest.raises(CloudWriteError, match="comfort .* or setback"):
+            _group_setpoint_dps(21.0, mode)
+
+
+class _MemTransport:
+    """In-memory MqttTransport double recording publishes and holding subscriptions."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, str, bool]] = []
+        self.subs: dict[str, Any] = {}
+
+    def publish(self, topic: str, payload: str, *, retain: bool = False) -> None:
+        self.published.append((topic, payload, retain))
+
+    def subscribe(self, topic: str, callback: Any) -> None:
+        self.subs[topic] = callback
+
+
+def _fake_cloud(devices: list[DanfossDevice]) -> SimpleNamespace:
+    return SimpleNamespace(
+        async_list_devices=AsyncMock(return_value=devices),
+        async_list_room_groups=AsyncMock(return_value=[]),
+        async_list_holidays=AsyncMock(return_value=[]),
+        async_set_room_setpoint=AsyncMock(return_value="grp1"),
+        async_close=AsyncMock(return_value=None),
+    )
+
+
+async def _run_set(dev: DanfossDevice, payload: dict) -> SimpleNamespace:
+    """Start the bridge with one device, deliver one ``/set`` payload, return the fake client."""
+    transport = _MemTransport()
+    client = _fake_cloud([dev])
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        async_run_bridge(
+            BridgeConfig(base_topic="danfoss2mqtt", poll_interval=30),
+            transport=transport,  # type: ignore[arg-type]
+            client=client,  # type: ignore[arg-type]
+            stop_event=stop_event,
+        )
+    )
+    await asyncio.sleep(0.05)
+    transport.subs["danfoss2mqtt/+/set"](f"danfoss2mqtt/{dev.name}/set", json.dumps(payload))
+    await asyncio.sleep(0.05)
+    stop_event.set()
+    await task
+    return client
+
+
+async def test_setpoint_write_setback_mode_targets_setback_dps() -> None:
+    # Fix #3: a head whose current slot is setback must write the SETBACK setpoint (DP 109 + 119),
+    # not comfort. Regression on the real-hardware bug (E-2 Circulation, 2026-11-22).
+    head = _head(dev_id="dev_sb", name="Circulation")
+    head.mode = "leaving_home"
+    client = await _run_set(head, {"occupied_heating_setpoint": 15.0})
+    client.async_set_room_setpoint.assert_awaited_once_with("dev_sb", {"109": 150, "119": 150})
+
+
+async def test_setpoint_write_refused_outside_comfort_or_setback() -> None:
+    # Fix #3: a head in any other mode (manual/pause/holiday) has no proven group method; the write
+    # is refused, never silently applied to comfort.
+    head = _head(dev_id="dev_m", name="Manual")
+    head.mode = "manual"
+    client = await _run_set(head, {"occupied_heating_setpoint": 21.0})
+    client.async_set_room_setpoint.assert_not_awaited()
+
+
+def test_publish_fleet_rooms_payload_shape() -> None:
+    # Fix #2: the bridge/rooms payload carries home_id + members per contract §3.
+    transport = _MemTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport, base_topic="danfoss2mqtt")  # type: ignore[arg-type]
+    room = RoomState(
+        group_id="g5",
+        name="Chapelle",
+        pid="pidX",
+        head_count=2,
+        online=True,
+        temperature=18.5,
+        setpoint=19.0,
+        mode="at_home",
+        heating=False,
+        home_gid="home9",
+        members=("dev_a", "dev_b"),
+    )
+    daemon.publish_fleet([_head()], rooms=[room], holidays={"home9": {"active": True}})
+    rooms_pub = [p for t, p, retain in transport.published if t == "danfoss2mqtt/bridge/rooms"]
+    assert json.loads(rooms_pub[-1])[0]["home_id"] == "home9"
+    assert json.loads(rooms_pub[-1])[0]["members"] == ["dev_a", "dev_b"]
+    hol_pub = [p for t, p, r in transport.published if t == "danfoss2mqtt/bridge/holidays"]
+    assert json.loads(hol_pub[-1]) == {"home9": {"active": True}}
+
+
+def test_publish_fleet_omits_room_and_holiday_topics_when_none() -> None:
+    transport = _MemTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport, base_topic="danfoss2mqtt")  # type: ignore[arg-type]
+    daemon.publish_fleet([_head()])
+    topics = {t for t, _, _ in transport.published}
+    assert "danfoss2mqtt/bridge/rooms" not in topics
+    assert "danfoss2mqtt/bridge/holidays" not in topics
+
+
+async def test_build_rooms_aggregates_members_and_degrades() -> None:
+    head = _head(dev_id="dev_1", name="Salle 101")
+    groups = [Room(group_id="g1", name="Salle 101", pid="p", home_gid="h1", members=("dev_1",))]
+    client = SimpleNamespace(async_list_room_groups=AsyncMock(return_value=groups))
+    rooms = await _build_rooms(client, [head])  # type: ignore[arg-type]
+    assert rooms is not None and len(rooms) == 1
+    assert rooms[0].members == ("dev_1",)
+    assert rooms[0].home_gid == "h1"
+    assert rooms[0].online is True
+
+    # Empty account -> [] (topic still published), read failure -> None (topic left untouched).
+    empty = SimpleNamespace(async_list_room_groups=AsyncMock(return_value=[]))
+    assert await _build_rooms(empty, [head]) == []  # type: ignore[arg-type]
+    boom = SimpleNamespace(async_list_room_groups=AsyncMock(side_effect=CloudError("down")))
+    assert await _build_rooms(boom, [head]) is None  # type: ignore[arg-type]
+
+
+async def test_build_holidays_maps_by_gid_and_degrades() -> None:
+    client = SimpleNamespace(
+        async_list_holidays=AsyncMock(
+            return_value=[
+                {"gid": "h1", "name": "A", "active": True},
+                {"name": "no gid"},  # dropped: no gid
+            ]
+        )
+    )
+    assert await _build_holidays(client) == {  # type: ignore[arg-type]
+        "h1": {"gid": "h1", "name": "A", "active": True}
+    }
+    boom = SimpleNamespace(async_list_holidays=AsyncMock(side_effect=CloudError("down")))
+    assert await _build_holidays(boom) is None  # type: ignore[arg-type]
 
 
 def test_unsupported_set_keys_cover_non_cloud_fields() -> None:
