@@ -247,6 +247,27 @@ def decode_attributes(payload: bytes) -> dict[int, int | None]:
     return out
 
 
+def decode_report_attributes(payload: bytes) -> dict[int, int | None]:
+    """ZCL Report Attributes (command 0x0A) payload -> {attribute: value}.
+
+    A Report Attributes record is ``attribute (2, LE) | type (1) | value`` with NO status byte,
+    unlike a Read Attributes Response record (``decode_attributes``, which carries the status). The
+    tunnel never issues these: the head emits them spontaneously, and they are the bulk of the DP
+    199 frames pushed on the cloud channel (local temperature, load estimate, window state, battery,
+    software error...). Same ``_LENGTH`` / ``_SIGNED`` tables as the rest of the decoder.
+    """
+    out: dict[int, int | None] = {}
+    i = 0
+    while i + 3 <= len(payload):
+        a, typ = int.from_bytes(payload[i : i + 2], "little"), payload[i + 2]
+        n = _LENGTH.get(typ)
+        if n is None or i + 3 + n > len(payload):
+            break
+        out[a] = int.from_bytes(payload[i + 3 : i + 3 + n], "little", signed=typ in _SIGNED)
+        i += 3 + n
+    return out
+
+
 def decode_schedule(payload: bytes) -> tuple[int, list[dict[str, Any]]]:
     """GetWeeklySchedule response -> (day bit, transitions [{h, c}])."""
     n, day = payload[0], payload[1]

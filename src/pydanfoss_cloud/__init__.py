@@ -24,6 +24,7 @@ from .client import (
     UnknownTargetError,
     derive_distinct_device_id,
 )
+from .cloud_dp199 import Dp199Decode, HeadOverlay, decode_dp199
 from .decode import (
     DanfossDevice,
     apply_dps_overlay,
@@ -67,7 +68,9 @@ __all__ = [
     "CloudWriteError",
     "DanfossDevice",
     "DanfossMessage",
+    "Dp199Decode",
     "GatewayKey",
+    "HeadOverlay",
     "Schedule",
     "ScheduleValidationError",
     "UnknownTargetError",
@@ -77,6 +80,7 @@ __all__ = [
     "clean_friendly_name",
     "count_transitions",
     "decode_device",
+    "decode_dp199",
     "decode_operation",
     "decode_z2m_descriptor",
     "decode_z2m_state",
