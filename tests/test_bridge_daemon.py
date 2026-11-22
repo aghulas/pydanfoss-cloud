@@ -534,3 +534,21 @@ def test_load_bridge_config_auto_generates_and_persists_device_id(tmp_path: Path
     # Second load reuses the exact same persisted device_id (stable across restarts)
     cfg2 = load_bridge_config(args)
     assert cfg2.device_id == cfg1.device_id
+
+
+def test_publish_fleet_includes_device_home_id() -> None:
+    from pydanfoss_cloud.bridge_daemon import StandaloneDanfoss2MqttDaemon
+
+    published: dict[str, str] = {}
+
+    class _Mem:
+        def publish(self, topic: str, payload: str, *, retain: bool = False) -> None:
+            published[topic] = payload
+
+        def subscribe(self, topic: str, callback: Any) -> None:
+            pass
+
+    daemon = StandaloneDanfoss2MqttDaemon(_Mem())
+    daemon.publish_fleet([_head("dev_1", "A-0 A03")], device_home={"dev_1": "244975257"})
+    devs = json.loads(published["danfoss2mqtt/bridge/devices"])
+    assert devs[0]["danfoss"]["home_id"] == "244975257"

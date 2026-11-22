@@ -279,6 +279,7 @@ class StandaloneDanfoss2MqttDaemon:
         rooms: list[RoomState] | None = None,
         local_attrs: dict[str, dict[str, Any]] | None = None,
         holidays: dict[str, Any] | None = None,
+        device_home: dict[str, str] | None = None,
     ) -> None:
         """Publish ``bridge/devices``, ``bridge/rooms``, ``bridge/holidays`` and all device states.
 
@@ -298,6 +299,8 @@ class StandaloneDanfoss2MqttDaemon:
                 self._by_node[dev.node_id] = dev
             if dev.is_head or dev.is_sensor or dev.is_relay:
                 desc = encode_z2m_descriptor(dev)
+                if device_home and dev.id in device_home:
+                    desc.setdefault("danfoss", {})["home_id"] = str(device_home[dev.id])
                 self._by_friendly[desc["friendly_name"]] = dev
                 descriptors.append(desc)
 
@@ -668,7 +671,9 @@ async def async_run_bridge(
                 devices = await client.async_list_devices()
                 rooms = await _build_rooms(client, devices)
                 holidays = await _build_holidays(client)
-                daemon.publish_fleet(devices, rooms=rooms, holidays=holidays)
+                raw_home = getattr(client, "device_home", None)
+                dev_home = raw_home if isinstance(raw_home, dict) else None
+                daemon.publish_fleet(devices, rooms=rooms, holidays=holidays, device_home=dev_home)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("danfoss2mqtt: poll cycle failed")
 
