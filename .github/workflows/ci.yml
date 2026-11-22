@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package with extras
+        run: pip install -e ".[mqtt,dev]"
+
+      - name: Ruff format & lint
+        run: |
+          ruff format --check src tests
+          ruff check src tests
+
+      - name: Mypy
+        run: mypy src/pydanfoss_cloud
+
+      - name: Pytest
+        run: pytest
+
+      - name: Build sdist & wheel + CLI smoke test
+        run: |
+          python -m build
+          danfoss2mqtt --dry-run
