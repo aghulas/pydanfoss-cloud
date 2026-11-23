@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydanfoss-cloud"
-version = "0.5.0"
+version = "0.6.0"
 description = "Pure-Python Danfoss Ally Cloud (path 1a), local Zigbee tunnel, Zigbee2MQTT dialect contract, standalone danfoss2mqtt bridge daemon, and read-only room coordinator."
 readme = "README.md"
 requires-python = ">=3.11"

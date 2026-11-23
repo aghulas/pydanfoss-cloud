@@ -213,6 +213,20 @@ class RoomStore:
         self.save()
         return room
 
+    def update_desired(self, room_id: str, changes: Mapping[str, Any]) -> CoordinatorRoom:
+        """Merge ``changes`` into a room's ``desired`` state and persist (§5, "what was asked").
+
+        The desired state is what a write stage *asked* for; the ``drift`` view compares it to what
+        the heads **report**. Seeding it does not touch a head — it is a definition update only.
+        """
+        room = self.get(room_id)
+        desired = dict(room.desired)
+        desired.update(changes)
+        room = replace(room, desired=desired)
+        self._rooms[room_id] = room
+        self.save()
+        return room
+
     def delete(self, room_id: str) -> None:
         self.get(room_id)  # raise if unknown
         del self._rooms[room_id]

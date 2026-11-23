@@ -379,6 +379,7 @@ def decode_z2m_state(
 def encode_z2m_set_command(
     *,
     setpoint: float | None = None,
+    setpoint_scheduled: bool = False,
     max_setpoint: float | None = None,
     min_setpoint: float | None = None,
     child_lock: bool | None = None,
@@ -389,12 +390,22 @@ def encode_z2m_set_command(
     load_room_mean: int | None = None,
 ) -> dict[str, Any]:
     """Build a ``<prefix>/<friendly_name>/set`` JSON command payload understood by both
-    ``zigbee2mqtt`` and ``danfoss2mqtt``."""
+    ``zigbee2mqtt`` and ``danfoss2mqtt``.
+
+    ``setpoint_scheduled`` picks the property carrying the setpoint (``docs/z2m-cloud-parity.md``
+    §3): ``occupied_heating_setpoint`` for a user change (aggressive valve response), or
+    ``occupied_heating_setpoint_scheduled`` for a change the coordinator makes on its own.
+    """
     cmd: dict[str, Any] = {}
     if setpoint is not None:
         if not (5.0 <= setpoint <= 35.0) or not math.isclose(round(setpoint * 2), setpoint * 2):
             raise ValueError(f"setpoint {setpoint} out of range (5.0..35.0 °C, step 0.5)")
-        cmd["occupied_heating_setpoint"] = float(setpoint)
+        prop = (
+            "occupied_heating_setpoint_scheduled"
+            if setpoint_scheduled
+            else ("occupied_heating_setpoint")
+        )
+        cmd[prop] = float(setpoint)
     if max_setpoint is not None:
         cmd["max_heat_setpoint_limit"] = float(max_setpoint)
     if min_setpoint is not None:
