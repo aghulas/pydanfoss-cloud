@@ -188,6 +188,7 @@ class DanfossDevice:
     state: str | None = None  # DP 3 work_state
     battery: float | None = None  # % (DP 34)
     valve_opening: float | None = None  # % (DP 170 pi_heating_demand)
+    load_estimate: int | None = None  # raw Danfoss radiator load estimate (int16, DP 108 / 0x404A)
     heat_request: bool | None = None  # DP 162 heat_supply_request
     window_open: bool | None = None  # DP 25 window_state
     window_detection: bool | None = None  # DP 116 window_toggle

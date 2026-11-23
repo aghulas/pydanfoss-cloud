@@ -121,6 +121,8 @@ def encode_z2m_state(
         out["occupied_heating_setpoint"] = dev.setpoint
     if dev.valve_opening is not None:
         out["pi_heating_demand"] = dev.valve_opening
+    if dev.load_estimate is not None:
+        out["load_estimate"] = dev.load_estimate
     heating = dev.heating
     if heating is not None:
         out["running_state"] = "heat" if heating else "idle"
@@ -278,6 +280,16 @@ def decode_z2m_state(
         dev.setpoint = float(payload["occupied_heating_setpoint_scheduled"])
     if "pi_heating_demand" in payload and payload["pi_heating_demand"] is not None:
         dev.valve_opening = float(payload["pi_heating_demand"])
+    if "load_estimate" in payload:
+        raw_le = payload["load_estimate"]
+        if raw_le is None:
+            dev.load_estimate = None
+        else:
+            try:
+                le = int(raw_le)
+                dev.load_estimate = None if le == -8000 else le
+            except (ValueError, TypeError):
+                pass
     if "running_state" in payload and isinstance(payload["running_state"], str):
         rs = payload["running_state"].strip().lower()
         dev.state = "Heat" if rs in ("heat", "heating") else "NoHeat"
