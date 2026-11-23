@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydanfoss-cloud"
-version = "0.4.5"
-description = "Pure-Python Danfoss Ally Cloud (path 1a), local Zigbee tunnel, Zigbee2MQTT dialect contract, and standalone danfoss2mqtt bridge daemon."
+version = "0.5.0"
+description = "Pure-Python Danfoss Ally Cloud (path 1a), local Zigbee tunnel, Zigbee2MQTT dialect contract, standalone danfoss2mqtt bridge daemon, and read-only room coordinator."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -36,6 +36,7 @@ Issues = "https://github.com/aghulas/pydanfoss-cloud/issues"
 
 [project.scripts]
 danfoss2mqtt = "pydanfoss_cloud.bridge_daemon:main"
+danfoss-room-coordinator = "pydanfoss_cloud.room_coordinator:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

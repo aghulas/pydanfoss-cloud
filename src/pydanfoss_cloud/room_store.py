@@ -1,0 +1,243 @@
+"""Room store of the standalone room coordinator (``docs/z2m-cloud-parity.md`` §5.1, §6).
+
+The coordinator owns heads that live on a Zigbee2MQTT coordinator with **no Danfoss gateway and no
+cloud** (``docs/z2m-cloud-parity.md`` §6). A Zigbee2MQTT room has no server-side existence, so the
+coordinator keeps its own definition of rooms here: one JSON file in the add-on's data folder.
+
+Pure data layer — no MQTT, no Home Assistant, no network. The coordinator daemon
+(:mod:`pydanfoss_cloud.room_coordinator`) loads this store, aggregates the members' **reported**
+state against it, and mutates it on ``<base>/bridge/request/room/*``.
+
+Stage 1 (read-only coordinator) scope: the store is the only thing a ``room/*`` request changes —
+a **room definition**, never a head. No ``/set`` is ever published from a request. The
+``desired`` and ``schedule`` fields exist in the model (they are what later write stages fan out),
+but nothing in Stage 1 drives a head from them; they only feed the read-only ``desired`` / ``drift``
+view (``docs/z2m-cloud-parity.md`` §5, "publishes what the heads report, never what it asked").
+
+Invariant (§5.1 "Single owner per head"): a head belongs to **at most one** room. The mutators
+refuse a member already owned by another room.
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+STORE_VERSION = 1
+
+
+class RoomStoreError(ValueError):
+    """A ``room/*`` request that cannot be applied (unknown room, duplicate member, bad input)."""
+
+
+def normalize_address(address: str) -> str:
+    """Canonical form of a Zigbee address for comparison (lowercase, no ``0x`` prefix).
+
+    Members are kept verbatim as the bridge publishes them (usually ``0x...``); matching a member
+    to a reported device is done on this normalized form so ``0xABCD`` and ``abcd`` are one head.
+    """
+    return address.strip().lower().removeprefix("0x")
+
+
+@dataclass(frozen=True)
+class CoordinatorRoom:
+    """One coordinator-defined room: a set of heads on one bridge prefix, plus an optional sensor.
+
+    - ``members`` / ``sensor`` are Zigbee addresses as the bridge publishes them (``ieee_address``).
+    - ``desired`` is the room's wanted state (setpoint, mode, room-wide settings). Empty in Stage 1
+      until a write stage fills it; read only for the ``desired`` / ``drift`` view meanwhile.
+    - ``schedule`` is the room's weekly schedule in the coordinator's own shape (filled by Stage 4).
+    """
+
+    room_id: str
+    name: str
+    prefix: str
+    home_id: str | None = None
+    members: tuple[str, ...] = ()
+    sensor: str | None = None
+    desired: dict[str, Any] = field(default_factory=dict)
+    schedule: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "room_id": self.room_id,
+            "name": self.name,
+            "prefix": self.prefix,
+            "home_id": self.home_id,
+            "members": list(self.members),
+            "sensor": self.sensor,
+            "desired": dict(self.desired),
+            "schedule": self.schedule,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> CoordinatorRoom:
+        room_id = str(raw.get("room_id") or "").strip()
+        name = str(raw.get("name") or room_id).strip()
+        prefix = str(raw.get("prefix") or "").strip().rstrip("/")
+        if not room_id or not prefix:
+            raise RoomStoreError("a stored room needs a room_id and a prefix")
+        members = tuple(str(m).strip() for m in (raw.get("members") or []) if str(m).strip())
+        sensor_raw = raw.get("sensor")
+        sensor = str(sensor_raw).strip() or None if sensor_raw else None
+        desired = dict(raw["desired"]) if isinstance(raw.get("desired"), Mapping) else {}
+        schedule = raw.get("schedule") if isinstance(raw.get("schedule"), Mapping) else None
+        return cls(
+            room_id=room_id,
+            name=name,
+            prefix=prefix,
+            home_id=(str(raw["home_id"]).strip() or None) if raw.get("home_id") else None,
+            members=members,
+            sensor=sensor,
+            desired=desired,
+            schedule=dict(schedule) if schedule is not None else None,
+        )
+
+
+def _new_room_id() -> str:
+    return f"room-{secrets.token_hex(4)}"
+
+
+class RoomStore:
+    """In-memory room map backed by a JSON file. All mutators persist on success.
+
+    Not thread-safe by itself: the coordinator calls it from one place (the request handler).
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self._path: Path | None = Path(path) if path is not None else None
+        self._rooms: dict[str, CoordinatorRoom] = {}
+
+    # --- persistence ---------------------------------------------------------------------------
+
+    def load(self) -> RoomStore:
+        """Load from disk if the file exists; an absent or empty file is an empty store."""
+        self._rooms = {}
+        if self._path is None or not self._path.exists():
+            return self
+        raw = self._path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return self
+        data = json.loads(raw)
+        rooms = data.get("rooms", []) if isinstance(data, Mapping) else []
+        for entry in rooms:
+            if isinstance(entry, Mapping):
+                room = CoordinatorRoom.from_dict(entry)
+                self._rooms[room.room_id] = room
+        return self
+
+    def save(self) -> None:
+        """Atomically write the store to disk (no-op when no path was configured)."""
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": STORE_VERSION, "rooms": [r.to_dict() for r in self._rooms.values()]}
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self._path)
+
+    # --- reads ---------------------------------------------------------------------------------
+
+    def rooms(self) -> list[CoordinatorRoom]:
+        return list(self._rooms.values())
+
+    def get(self, room_id: str) -> CoordinatorRoom:
+        try:
+            return self._rooms[room_id]
+        except KeyError:
+            raise RoomStoreError(f"unknown room {room_id!r}") from None
+
+    def __len__(self) -> int:
+        return len(self._rooms)
+
+    # --- mutators (persist on success) ---------------------------------------------------------
+
+    def create(
+        self,
+        name: str,
+        prefix: str,
+        *,
+        members: Iterable[str] = (),
+        sensor: str | None = None,
+        home_id: str | None = None,
+        room_id: str | None = None,
+    ) -> CoordinatorRoom:
+        name = (name or "").strip()
+        prefix = (prefix or "").strip().rstrip("/")
+        if not name:
+            raise RoomStoreError("a room needs a name")
+        if not prefix:
+            raise RoomStoreError("a room needs a bridge prefix")
+        rid = (room_id or "").strip() or _new_room_id()
+        if rid in self._rooms:
+            raise RoomStoreError(f"room {rid!r} already exists")
+        member_tuple = self._clean_members(members)
+        self._check_owner_free(member_tuple, owner=None)
+        room = CoordinatorRoom(
+            room_id=rid,
+            name=name,
+            prefix=prefix,
+            home_id=(home_id or None),
+            members=member_tuple,
+            sensor=(sensor or None),
+        )
+        self._rooms[rid] = room
+        self.save()
+        return room
+
+    def rename(self, room_id: str, name: str) -> CoordinatorRoom:
+        name = (name or "").strip()
+        if not name:
+            raise RoomStoreError("a room needs a name")
+        room = replace(self.get(room_id), name=name)
+        self._rooms[room_id] = room
+        self.save()
+        return room
+
+    def set_members(self, room_id: str, members: Iterable[str]) -> CoordinatorRoom:
+        room = self.get(room_id)
+        member_tuple = self._clean_members(members)
+        self._check_owner_free(member_tuple, owner=room_id)
+        room = replace(room, members=member_tuple)
+        self._rooms[room_id] = room
+        self.save()
+        return room
+
+    def set_sensor(self, room_id: str, sensor: str | None) -> CoordinatorRoom:
+        room = replace(self.get(room_id), sensor=(sensor or None))
+        self._rooms[room_id] = room
+        self.save()
+        return room
+
+    def delete(self, room_id: str) -> None:
+        self.get(room_id)  # raise if unknown
+        del self._rooms[room_id]
+        self.save()
+
+    # --- helpers -------------------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_members(members: Iterable[str]) -> tuple[str, ...]:
+        seen: dict[str, str] = {}
+        for raw in members:
+            addr = str(raw).strip()
+            if not addr:
+                continue
+            seen.setdefault(normalize_address(addr), addr)
+        return tuple(seen.values())
+
+    def _check_owner_free(self, members: tuple[str, ...], *, owner: str | None) -> None:
+        """Enforce §5.1: no member may already belong to a different room."""
+        wanted = {normalize_address(m) for m in members}
+        for room in self._rooms.values():
+            if room.room_id == owner:
+                continue
+            clash = wanted & {normalize_address(m) for m in room.members}
+            if clash:
+                raise RoomStoreError(
+                    f"head(s) {sorted(clash)} already belong to room {room.room_id!r}"
+                )
