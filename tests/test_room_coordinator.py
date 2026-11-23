@@ -240,3 +240,204 @@ def test_sensor_feeds_room_temperature() -> None:
     room = json.loads(tx.last("danfoss-rooms/bridge/rooms"))[0]
     assert room["temperature"] == 20.5
     assert room["humidity"] == 44.0
+
+
+# --- Stage 2: setpoint fan-out (closed by default) ---------------------------------------------
+
+
+def _armed(store, room_id, *, timeout=30.0, retries=2, source="zigbee2mqtt", base="danfoss-rooms"):
+    """A coordinator with ``room_id`` armed for setpoint fan-out."""
+    tx = FakeTransport()
+    coord = RoomCoordinator(
+        tx,
+        store,
+        source_prefix=source,
+        base_topic=base,
+        armed_rooms=(room_id,),
+        setpoint_timeout_s=timeout,
+        setpoint_retries=retries,
+    )
+    return tx, coord
+
+
+def _join(coord) -> None:  # noqa: ANN001
+    for thread in list(coord._jobs):  # type: ignore[attr-defined]
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+
+def _sets(tx) -> list[tuple[str, dict]]:  # noqa: ANN001
+    return [(t, json.loads(p)) for t, p, _r in tx.published if t.endswith("/set")]
+
+
+def test_set_setpoint_closed_by_default_refused_and_silent() -> None:
+    """An unarmed room is refused; nothing is sent (the coordinator stays read-only)."""
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _make(store=store)  # no armed rooms
+    coord.start()
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject(
+        "danfoss-rooms/bridge/request/room/set-setpoint",
+        {"room_id": "r1", "setpoint": 21.0, "transaction": "t1"},
+    )
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["status"] == "closed"
+    assert resp["transaction"] == "t1"
+    assert _sets(tx) == []  # not one /set
+    # Desired was not seeded either.
+    assert json.loads(tx.last("danfoss-rooms/bridge/rooms"))[0]["desired"] == {}
+
+
+def test_set_setpoint_unknown_room_errors_and_silent() -> None:
+    store = RoomStore()
+    tx, coord = _armed(store, "r1")
+    coord.start()
+    tx.inject(
+        "danfoss-rooms/bridge/request/room/set-setpoint", {"room_id": "nope", "setpoint": 20.0}
+    )
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["status"] == "error"
+    assert _sets(tx) == []
+
+
+def test_set_setpoint_invalid_value_refused_and_silent() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _armed(store, "r1")
+    coord.start()
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject("danfoss-rooms/bridge/request/room/set-setpoint", {"room_id": "r1", "setpoint": 20.3})
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["status"] == "error"
+    assert resp["job_status"] == "failed"
+    assert _sets(tx) == []
+
+
+def test_set_setpoint_armed_room_fans_out_and_confirms() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA", "0xBBBB"], room_id="r1")
+    tx, coord = _armed(store, "r1")
+    coord.start()
+    tx.inject(
+        "zigbee2mqtt/bridge/devices",
+        [_descriptor("liv_1", "0xAAAA"), _descriptor("liv_2", "0xBBBB")],
+    )
+    # Heads start at a different setpoint, so confirmation exercises the write->report cycle.
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 18.0})
+    tx.inject("zigbee2mqtt/liv_2", {"occupied_heating_setpoint": 18.0})
+    tx.inject(
+        "danfoss-rooms/bridge/request/room/set-setpoint",
+        {"room_id": "r1", "setpoint": 21.0, "source": "user", "transaction": "t9"},
+    )
+    # The heads report the new setpoint; the worker confirms each in turn.
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 21.0})
+    tx.inject("zigbee2mqtt/liv_2", {"occupied_heating_setpoint": 21.0})
+    _join(coord)
+
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["status"] == "ok"
+    assert resp["job_status"] == "applied"
+    assert resp["setpoint"] == 21.0
+    assert resp["property"] == "occupied_heating_setpoint"
+    assert {h["address"]: h["status"] for h in resp["heads"]} == {
+        "0xAAAA": "applied",
+        "0xBBBB": "applied",
+    }
+    assert resp["transaction"] == "t9"
+    # One /set per head, with the user property.
+    topics = {t for t, _p in _sets(tx)}
+    assert topics == {"zigbee2mqtt/liv_1/set", "zigbee2mqtt/liv_2/set"}
+    assert all("occupied_heating_setpoint" in p for _t, p in _sets(tx))
+    # Desired seeded; with both heads reporting 21.0, no drift.
+    room = json.loads(tx.last("danfoss-rooms/bridge/rooms"))[0]
+    assert room["desired"] == {"setpoint": 21.0}
+    assert room["drift"] == []
+
+
+def test_set_setpoint_coordinator_source_uses_scheduled_property() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _armed(store, "r1")
+    coord.start()
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 18.0})
+    tx.inject(
+        "danfoss-rooms/bridge/request/room/set-setpoint",
+        {"room_id": "r1", "setpoint": 19.5, "source": "coordinator"},
+    )
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint_scheduled": 19.5})
+    _join(coord)
+    sets = _sets(tx)
+    assert len(sets) == 1
+    assert "occupied_heating_setpoint_scheduled" in sets[0][1]
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["property"] == "occupied_heating_setpoint_scheduled"
+    assert resp["heads"][0]["status"] == "applied"
+
+
+def test_set_setpoint_unreachable_on_timeout() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _armed(store, "r1", timeout=0.3, retries=0)
+    coord.start()
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 18.0})
+    tx.inject("danfoss-rooms/bridge/request/room/set-setpoint", {"room_id": "r1", "setpoint": 21.0})
+    _join(coord)  # the head never reports 21.0
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["heads"][0]["status"] == "unreachable"
+    assert resp["status"] == "ok"
+    assert resp["job_status"] == "unconfirmed"
+    # The /set was still attempted once (no retries).
+    assert len(_sets(tx)) == 1
+
+
+def test_set_setpoint_mismatch_when_head_reports_other_value() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _armed(store, "r1", timeout=0.3, retries=0)
+    coord.start()
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject("danfoss-rooms/bridge/request/room/set-setpoint", {"room_id": "r1", "setpoint": 21.0})
+    # The head reports a different value within the window: a mismatch, not unreachable.
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 19.0})
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["heads"][0]["status"] == "mismatch"
+
+
+def test_set_setpoint_absent_member_reported_unreachable() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA", "0xCCCC"], room_id="r1")
+    tx, coord = _armed(store, "r1", timeout=0.3, retries=0)
+    coord.start()
+    # Only liv_1 (0xAAAA) is known to the bridge; 0xCCCC was never reported.
+    tx.inject("zigbee2mqtt/bridge/devices", [_descriptor("liv_1", "0xAAAA")])
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 18.0})
+    tx.inject("danfoss-rooms/bridge/request/room/set-setpoint", {"room_id": "r1", "setpoint": 21.0})
+    tx.inject("zigbee2mqtt/liv_1", {"occupied_heating_setpoint": 21.0})
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    byaddr = {h["address"]: h["status"] for h in resp["heads"]}
+    assert byaddr["0xAAAA"] == "applied"
+    assert byaddr["0xCCCC"] == "unreachable"
+    assert resp["status"] == "ok"
+    assert resp["job_status"] == "partial"
+    # No /set was addressed to the absent member.
+    assert all("0xCCCC" not in t and "cccc" not in t.lower() for t, _p in _sets(tx))
+
+
+def test_set_setpoint_bad_json_errors() -> None:
+    store = RoomStore()
+    store.create("Living", "zigbee2mqtt", members=["0xAAAA"], room_id="r1")
+    tx, coord = _armed(store, "r1")
+    coord.start()
+    tx.inject("danfoss-rooms/bridge/request/room/set-setpoint", "{not json")
+    _join(coord)
+    resp = json.loads(tx.last("danfoss-rooms/bridge/response/room/set-setpoint"))
+    assert resp["status"] == "error"
+    assert _sets(tx) == []
