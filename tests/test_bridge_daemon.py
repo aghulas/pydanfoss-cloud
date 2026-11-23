@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from pydanfoss_cloud import bridge_daemon
 from pydanfoss_cloud.bridge_daemon import (
     _CLOUD_UNSUPPORTED_SET_KEYS,
     AVAIL_OFFLINE,
@@ -24,11 +25,13 @@ from pydanfoss_cloud.bridge_daemon import (
     _topic_matches,
     async_run_bridge,
     build_arg_parser,
+    build_cloud_mqtt_listener,
     load_bridge_config,
     main,
 )
 from pydanfoss_cloud.client import CloudError, CloudWriteError
 from pydanfoss_cloud.decode import DanfossDevice
+from pydanfoss_cloud.keys import GatewayKey
 from pydanfoss_cloud.rooms import Room, RoomState
 
 
@@ -552,3 +555,110 @@ def test_publish_fleet_includes_device_home_id() -> None:
     daemon.publish_fleet([_head("dev_1", "A-0 A03")], device_home={"dev_1": "244975257"})
     devs = json.loads(published["danfoss2mqtt/bridge/devices"])
     assert devs[0]["danfoss"]["home_id"] == "244975257"
+
+
+# --- cloud-MQTT DP 199 listener builder -------------------------------------------------------
+# Synthetic: a SimpleNamespace stands in for CloudClient, gateway keys are injected. No network —
+# the link is built but never started, so this exercises only the wiring (credentials derived,
+# listen-only, on_frame bound to the daemon's overlay), not a live Tuya connection.
+
+_LISTEN_CFG = BridgeConfig(
+    region="eu",
+    sign_key="sign_key_value",
+    ch_key="ch_key_value",
+    device_id="a" * 44,
+    cloud_mqtt_listen=True,
+)
+
+
+def _noop_transport() -> SimpleNamespace:
+    return SimpleNamespace(publish=lambda *a, **k: None, subscribe=lambda *a, **k: None)
+
+
+def _session_client(*, complete: bool = True) -> SimpleNamespace:
+    ident = (
+        {"uid": "uid1", "partner_identity": "pid1"}
+        if complete
+        else {"uid": None, "partner_identity": None}
+    )
+    sess = {"sid": "sid1", "ecode": "ec1"} if complete else {"sid": None, "ecode": None}
+    return SimpleNamespace(
+        mqtt_identity=ident,
+        session=sess,
+        async_login=AsyncMock(return_value=None),
+    )
+
+
+def test_build_cloud_mqtt_listener_wires_overlay(monkeypatch: Any) -> None:
+    client = _session_client()
+    monkeypatch.setattr(
+        bridge_daemon,
+        "async_fetch_gateway_keys",
+        AsyncMock(return_value={"gw1": GatewayKey(dev_id="gw1", name="GW", local_key="k" * 16)}),
+    )
+    daemon = StandaloneDanfoss2MqttDaemon(_noop_transport())
+
+    link = asyncio.run(build_cloud_mqtt_listener(_LISTEN_CFG, client, daemon))
+
+    assert link is not None
+    assert link.listen_only is True
+    assert link.on_frame == daemon.on_cloud_frame
+    assert set(link.gateways) == {"gw1"}
+    client.async_login.assert_not_awaited()  # session already complete
+
+
+def test_build_cloud_mqtt_listener_logs_in_when_session_incomplete(monkeypatch: Any) -> None:
+    client = _session_client(complete=False)
+
+    async def _login() -> None:
+        client.mqtt_identity = {"uid": "uid2", "partner_identity": "pid2"}
+        client.session = {"sid": "sid2", "ecode": "ec2"}
+
+    client.async_login = AsyncMock(side_effect=_login)
+    monkeypatch.setattr(
+        bridge_daemon,
+        "async_fetch_gateway_keys",
+        AsyncMock(return_value={"gw1": GatewayKey(dev_id="gw1", name="GW", local_key="k" * 16)}),
+    )
+    daemon = StandaloneDanfoss2MqttDaemon(_noop_transport())
+
+    link = asyncio.run(build_cloud_mqtt_listener(_LISTEN_CFG, client, daemon))
+
+    assert link is not None
+    client.async_login.assert_awaited_once()
+
+
+def test_build_cloud_mqtt_listener_none_when_no_gateway(monkeypatch: Any) -> None:
+    client = _session_client()
+    monkeypatch.setattr(bridge_daemon, "async_fetch_gateway_keys", AsyncMock(return_value={}))
+    daemon = StandaloneDanfoss2MqttDaemon(_noop_transport())
+
+    assert asyncio.run(build_cloud_mqtt_listener(_LISTEN_CFG, client, daemon)) is None
+
+
+def test_build_cloud_mqtt_listener_none_when_session_incomplete(monkeypatch: Any) -> None:
+    client = _session_client(complete=False)  # async_login does not complete it
+    monkeypatch.setattr(
+        bridge_daemon,
+        "async_fetch_gateway_keys",
+        AsyncMock(return_value={"gw1": GatewayKey(dev_id="gw1", name="GW", local_key="k" * 16)}),
+    )
+    daemon = StandaloneDanfoss2MqttDaemon(_noop_transport())
+
+    assert asyncio.run(build_cloud_mqtt_listener(_LISTEN_CFG, client, daemon)) is None
+
+
+def test_build_cloud_mqtt_listener_none_without_sign_ch_device() -> None:
+    client = _session_client()
+    daemon = StandaloneDanfoss2MqttDaemon(_noop_transport())
+    cfg = BridgeConfig(region="eu", cloud_mqtt_listen=True)  # no sign_key/ch_key/device_id
+
+    assert asyncio.run(build_cloud_mqtt_listener(cfg, client, daemon)) is None
+
+
+def test_load_bridge_config_cloud_mqtt_listen_flag() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(["--cloud-mqtt-listen"])
+    assert load_bridge_config(args).cloud_mqtt_listen is True
+    args_off = parser.parse_args([])
+    assert load_bridge_config(args_off).cloud_mqtt_listen is False
