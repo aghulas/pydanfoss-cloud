@@ -21,6 +21,15 @@ It provides:
 - `mqtt_client` — `CloudMqttLink`, the live link built on that codec (paho-mqtt, extra `mqtt`):
   inbound report decoding, DP publish, confirmation by the gateway's echo. One connection per Tuya
   session; the write path carries the DPs proven on real hardware only (`writes.MQTT_WRITE_DPS`).
+- `bridge_daemon` — standalone `danfoss2mqtt` bridge (CLI `danfoss2mqtt`): publishes the gateway
+  fleet and native rooms in the Zigbee2MQTT dialect on Mosquitto.
+- `room_store` / `room_view` / `room_coordinator` — **read-only room coordinator** (CLI
+  `danfoss-room-coordinator`), a sibling of `danfoss2mqtt` for heads on a Zigbee2MQTT coordinator
+  with no gateway/cloud. It keeps its own room store, aggregates what the heads **report** into
+  `<base>/bridge/rooms` and `<base>/bridge/heat_demand` under its own prefix, and answers
+  `bridge/request/room/*` (store only). Stage 1 writes **nothing** to a head; setpoint fan-out,
+  sensor feed and schedule are later, trial-gated stages (`docs/z2m-cloud-parity.md` in
+  `ha-danfoss-ally`).
 
 Wire format and derivations: `docs/cloud-mqtt-publish.md` in the repository.
 

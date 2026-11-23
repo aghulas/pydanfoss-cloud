@@ -36,6 +36,9 @@ from .decode import (
 )
 from .keys import GatewayKey, async_fetch_gateway_keys
 from .messages import DanfossMessage, parse_messages
+from .room_coordinator import RoomCoordinator
+from .room_store import CoordinatorRoom, RoomStore, RoomStoreError
+from .room_view import build_heat_demand, build_room_view
 from .schedule import Schedule, count_transitions, validate_days
 from .writes import (
     MQTT_CANDIDATE_DPS,
@@ -66,16 +69,22 @@ __all__ = [
     "CloudClient",
     "CloudError",
     "CloudWriteError",
+    "CoordinatorRoom",
     "DanfossDevice",
     "DanfossMessage",
     "Dp199Decode",
     "GatewayKey",
     "HeadOverlay",
+    "RoomCoordinator",
+    "RoomStore",
+    "RoomStoreError",
     "Schedule",
     "ScheduleValidationError",
     "UnknownTargetError",
     "apply_dps_overlay",
     "async_fetch_gateway_keys",
+    "build_heat_demand",
+    "build_room_view",
     "classify_z2m_descriptor",
     "clean_friendly_name",
     "count_transitions",
