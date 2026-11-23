@@ -38,7 +38,14 @@ from .const import (
     WRITE_VERIFIED_PRODUCTS,
 )
 from .decode import DanfossDevice
-from .mqtt_client import _new_paho_client
+from .keys import async_fetch_gateway_keys
+from .mqtt_client import (
+    CloudMqttLink,
+    GatewayRef,
+    MqttCredentials,
+    _new_paho_client,
+    build_credentials,
+)
 from .rooms import RoomState, aggregate_room
 from .writes import encode_setpoint
 from .z2m_contract import encode_z2m_descriptor, encode_z2m_state
@@ -78,6 +85,10 @@ class BridgeConfig:
     device_id: str | None = None
     ch_key: str | None = None
     poll_interval: int = DEFAULT_POLL_INTERVAL
+    # Open a LISTEN-ONLY Tuya cloud-MQTT link so DP 199 pushes feed the heads' read-state overlay
+    # (``cloud_dp199``). OFF by default: it opens a second connection to the user's real Tuya
+    # account, and the live path is not yet validated on real hardware. Never publishes.
+    cloud_mqtt_listen: bool = False
 
     @property
     def has_cloud_credentials(self) -> bool:
@@ -419,6 +430,25 @@ class StandaloneDanfoss2MqttDaemon:
         self.publish_device(dev)
         return overlay.apply_to(dev)
 
+    def on_cloud_frame(self, gateway_id: str, frame: Any) -> None:
+        """Route a decoded cloud-MQTT inbound frame to the DP 199 overlay (``apply_cloud_push``).
+
+        Matches the ``mqtt_client.CloudMqttLink.on_frame`` signature, so a live listen-only link
+        feeds the overlay with no glue at the call site: ``link.on_frame = daemon.on_cloud_frame``.
+        Runs on the MQTT client's network thread; it only touches the daemon's own state and
+        republishes through the transport. ``gateway_id`` is unused here: ``apply_cloud_push``
+        routes by the head's ``cid`` (its Zigbee node id), which the frame's ``data`` carries. A
+        frame with no ``cid``/``dps`` (e.g. a poll-control check-in, or a publish echo) is ignored.
+        """
+        data = getattr(frame, "data", None)
+        if not isinstance(data, dict):
+            return
+        cid = data.get("cid")
+        dps = data.get("dps")
+        if not isinstance(cid, str) or not isinstance(dps, dict):
+            return
+        self.apply_cloud_push(cid, dps)
+
     def _handle_set(self, topic: str, raw_payload: str) -> None:
         if self._on_device_set is None:
             return
@@ -549,6 +579,85 @@ async def _build_holidays(client: CloudClient) -> dict[str, Any] | None:
     return {str(h["gid"]): h for h in items if h.get("gid") is not None}
 
 
+async def build_cloud_mqtt_listener(
+    config: BridgeConfig,
+    client: CloudClient,
+    daemon: StandaloneDanfoss2MqttDaemon,
+) -> CloudMqttLink | None:
+    """Build a LISTEN-ONLY cloud-MQTT link whose decoded frames feed the DP 199 overlay.
+
+    The link's ``on_frame`` is ``daemon.on_cloud_frame``, so every authenticated inbound frame is
+    routed to ``apply_cloud_push`` (DP 199 -> read-state overlay). It is always ``listen_only`` —
+    the bridge only consumes pushes on this channel, it never publishes over it.
+
+    Credentials are derived from the bridge client's OWN session (``mqtt_identity`` / ``session``),
+    logging in once if that session is not yet complete, and from the config's region/sign/ch/device
+    material; a ``creds_provider`` rebuilds them from the current session on each reconnect, so a
+    rotated session is picked up. Gateway crypto comes from ``async_fetch_gateway_keys``.
+
+    Returns ``None`` (logged, never raised) when the material is incomplete — an incomplete session,
+    no gateway with a local key, or missing sign/ch/device config. Does NOT open the connection
+    (``link.start``); the caller starts it off the event loop.
+    """
+    if not (config.sign_key and config.ch_key and config.device_id):
+        _LOGGER.warning("cloud-mqtt listener: sign_key/ch_key/device_id missing; skipped")
+        return None
+
+    def _complete(ident: dict[str, str | None], sess: dict[str, str | None]) -> bool:
+        return bool(
+            ident.get("uid")
+            and ident.get("partner_identity")
+            and sess.get("sid")
+            and sess.get("ecode")
+        )
+
+    ident = client.mqtt_identity
+    sess = client.session
+    if not _complete(ident, sess):
+        try:
+            await client.async_login()
+        except CloudError:
+            _LOGGER.warning("cloud-mqtt listener: login failed; skipped", exc_info=True)
+            return None
+        ident = client.mqtt_identity
+        sess = client.session
+    if not _complete(ident, sess):
+        _LOGGER.warning("cloud-mqtt listener: session incomplete (uid/partnerIdentity); skipped")
+        return None
+
+    try:
+        gateways = await async_fetch_gateway_keys(client)
+    except CloudError:
+        _LOGGER.warning("cloud-mqtt listener: gateway key fetch failed; skipped", exc_info=True)
+        return None
+    if not gateways:
+        _LOGGER.warning("cloud-mqtt listener: no gateway with a local key; skipped")
+        return None
+
+    def _fresh_creds() -> MqttCredentials:
+        i = client.mqtt_identity
+        s = client.session
+        return build_credentials(
+            region=config.region,
+            sign_key=config.sign_key or "",
+            sid=s.get("sid") or "",
+            ecode=s.get("ecode") or "",
+            uid=i.get("uid") or "",
+            partner_identity=i.get("partner_identity") or "",
+            device_id=config.device_id or "",
+            ch_key=config.ch_key or "",
+        )
+
+    refs = {gw_id: GatewayRef(dev_id=gw_id, local_key=k.local_key) for gw_id, k in gateways.items()}
+    return CloudMqttLink(
+        credentials=_fresh_creds(),
+        gateways=refs,
+        creds_provider=_fresh_creds,
+        on_frame=daemon.on_cloud_frame,
+        listen_only=True,
+    )
+
+
 async def async_run_bridge(
     config: BridgeConfig,
     *,
@@ -665,6 +774,20 @@ async def async_run_bridge(
     )
     daemon.start()
 
+    cloud_link: CloudMqttLink | None = None
+    if config.cloud_mqtt_listen:
+        try:
+            cloud_link = await build_cloud_mqtt_listener(config, client, daemon)
+            if cloud_link is not None:
+                await loop.run_in_executor(None, cloud_link.start)
+                _LOGGER.info(
+                    "danfoss2mqtt: cloud-MQTT DP 199 listener started (listen-only, %d gateway(s))",
+                    len(cloud_link.gateways),
+                )
+        except Exception:  # noqa: BLE001 - a listener failure must never break the poll loop
+            _LOGGER.exception("danfoss2mqtt: cloud-MQTT listener setup failed")
+            cloud_link = None
+
     try:
         while not stop.is_set():
             try:
@@ -690,6 +813,9 @@ async def async_run_bridge(
             for task in done:
                 task.result()
     finally:
+        if cloud_link is not None:
+            with contextlib.suppress(Exception):
+                await loop.run_in_executor(None, cloud_link.stop)
         daemon.stop()
         if own_client:
             await client.async_close()
@@ -751,6 +877,9 @@ def load_bridge_config(
         poll_interval=int(
             _pick("poll_interval", "poll_interval", "DANFOSS_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)
         ),
+        cloud_mqtt_listen=bool(
+            _pick("cloud_mqtt_listen", "cloud_mqtt_listen", "DANFOSS_CLOUD_MQTT_LISTEN", False)
+        ),
     )
 
 
@@ -777,6 +906,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Cloud poll interval in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--cloud-mqtt-listen",
+        dest="cloud_mqtt_listen",
+        action="store_true",
+        default=None,
+        help="Open a listen-only Tuya cloud-MQTT link so DP 199 pushes feed the read-state overlay",
     )
     parser.add_argument(
         "--dry-run",

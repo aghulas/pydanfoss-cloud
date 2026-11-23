@@ -351,3 +351,51 @@ def test_bridge_local_tunnel_attr_wins_over_cloud_push() -> None:
     state = _last_state(transport, "Office")
     # Tunnel (on-demand reader) wins on a key present in both sources.
     assert state["setpoint_change_source"] == 0
+
+
+# --- live listener adapter (on_cloud_frame) ---------------------------------------------------
+# These simulate the ``CloudMqttLink.on_frame(gateway_id, frame)`` callback with a synthetic frame
+# object (anything exposing ``.data``), the exact contract a live listen-only link would use. No
+# network, no real identifier: the frame is the same base64 DP 199 payload decoded above, wrapped in
+# the ``{"cid", "dps"}`` envelope the gateway sends inbound.
+
+
+class _Frame:
+    """Stand-in for ``mqtt_publish.Frame``: only ``.data`` is read by ``on_cloud_frame``."""
+
+    def __init__(self, data: object) -> None:
+        self.data = data
+
+
+def test_on_cloud_frame_routes_push_to_overlay() -> None:
+    transport = _RecordingTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport)
+    daemon.publish_fleet([_head_with_node()])
+
+    frame = read_response_frame(
+        [
+            (0x0012, 0, 0x29, 2250),  # 22.5 °C
+            (0x0025, 0, 0x18, 3),  # schedule + preheat
+        ]
+    )
+    # gateway id is carried by the topic, not used for routing; cid routes to the head.
+    daemon.on_cloud_frame("gw-xyz", _Frame({"cid": "abcd", "dps": {"199": b64(frame)}}))
+
+    state = _last_state(transport, "Office")
+    assert state["occupied_heating_setpoint"] == 22.5
+    assert state["programming_operation_mode"] == "schedule_with_preheat"
+
+
+def test_on_cloud_frame_ignores_frames_without_cid_or_dps() -> None:
+    transport = _RecordingTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport)
+    daemon.publish_fleet([_head_with_node()])
+    before = len(transport.published)
+
+    known = b64(read_response_frame([(0x0012, 0, 0x29, 2250)]))
+    daemon.on_cloud_frame("gw", _Frame(None))  # e.g. a non-dict payload
+    daemon.on_cloud_frame("gw", _Frame({"dps": {"199": known}}))  # no cid (not a head report)
+    daemon.on_cloud_frame("gw", _Frame({"cid": "abcd"}))  # poll-control check-in: no dps
+    daemon.on_cloud_frame("gw", _Frame({"cid": "abcd", "dps": "nope"}))  # dps not a map
+
+    assert len(transport.published) == before  # nothing republished
