@@ -28,7 +28,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .client import CloudClient, CloudError, CloudWriteError
+from .client import (
+    CloudClient,
+    CloudError,
+    CloudWriteError,
+    ScheduleValidationError,
+    UnknownTargetError,
+)
 from .cloud_dp199 import HeadOverlay, decode_dp199
 from .const import (
     MODE_GROUP_SETPOINT_DP,
@@ -256,7 +262,7 @@ class StandaloneDanfoss2MqttDaemon:
         base_topic: str = "danfoss2mqtt",
         *,
         on_device_set: Callable[[DanfossDevice, dict[str, Any]], None] | None = None,
-        on_bridge_request: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        on_bridge_request: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self._transport = transport
         self._base = base_topic.rstrip("/") or "danfoss2mqtt"
@@ -469,21 +475,29 @@ class StandaloneDanfoss2MqttDaemon:
             return
         self._on_device_set(dev, payload)
 
+    def publish_bridge_response(
+        self, action: str, reply: dict[str, Any], *, transaction: Any = None
+    ) -> None:
+        """Publish an RPC reply on ``<base>/bridge/response/<action>``."""
+        out = dict(reply)
+        if transaction is not None and "transaction" not in out:
+            out["transaction"] = transaction
+        self._transport.publish(
+            f"{self._base}/bridge/response/{action}", json.dumps(out), retain=False
+        )
+
     def _handle_bridge_request(self, topic: str, raw_payload: str) -> None:
         prefix = f"{self._base}/bridge/request/"
         if not topic.startswith(prefix):
             return
         action = topic[len(prefix) :]
-        resp_topic = f"{self._base}/bridge/response/{action}"
         try:
             payload = json.loads(raw_payload) if raw_payload else {}
             if not isinstance(payload, dict):
                 raise ValueError("JSON object expected")
         except ValueError as err:
-            self._transport.publish(
-                resp_topic,
-                json.dumps({"status": "error", "error": f"invalid JSON: {err}"}),
-                retain=False,
+            self.publish_bridge_response(
+                action, {"status": "error", "error": f"invalid JSON: {err}"}
             )
             return
 
@@ -493,12 +507,14 @@ class StandaloneDanfoss2MqttDaemon:
         else:
             try:
                 data = self._on_bridge_request(action, payload)
+                if data is None:
+                    # Deferred/async handler will publish its own response via
+                    # ``publish_bridge_response`` once the underlying call completes.
+                    return
                 reply = {"status": "ok", "data": data}
             except Exception as err:  # noqa: BLE001
                 reply = {"status": "error", "error": str(err)}
-        if tx is not None:
-            reply["transaction"] = tx
-        self._transport.publish(resp_topic, json.dumps(reply), retain=False)
+        self.publish_bridge_response(action, reply, transaction=tx)
 
 
 # Zigbee2MQTT ``/set`` fields the standalone cloud bridge has NO proven path 1a for from the
@@ -760,10 +776,81 @@ async def async_run_bridge(
 
         loop.call_soon_threadsafe(_spawn)
 
-    def _on_bridge_request(action: str, _payload: dict[str, Any]) -> dict[str, Any]:
+    async def _apply_bridge_request(action: str, payload: dict[str, Any]) -> None:
+        tx = payload.get("transaction")
+        target = payload.get("target")
+        if not isinstance(target, dict) or target.get("type") != "room" or not target.get("id"):
+            daemon.publish_bridge_response(
+                action,
+                {
+                    "status": "error",
+                    "code": "unknown_room",
+                    "error": f"{action} requires a room target ({{type: 'room', id: ...}})",
+                },
+                transaction=tx,
+            )
+            return
+        room_target = {"type": "room", "id": str(target["id"])}
+        try:
+            if action == "get_schedule":
+                data = await client.async_get_schedule(room_target)
+            elif action == "set_schedule":
+                days = payload.get("days")
+                if not isinstance(days, dict):
+                    raise ValueError("set_schedule requires a 'days' mapping")
+                await client.async_set_schedule_days(room_target, days)
+                refresh_event.set()
+                data = {"target": room_target, "written": True}
+            else:  # restore_schedule
+                await client.async_restore_schedule(room_target)
+                refresh_event.set()
+                data = {"target": room_target, "restored": True}
+            daemon.publish_bridge_response(action, {"status": "ok", "data": data}, transaction=tx)
+        except ScheduleValidationError as err:
+            first = err.errors[0]
+            daemon.publish_bridge_response(
+                action,
+                {
+                    "status": "error",
+                    "code": first["code"],
+                    "error": first["message"],
+                    "errors": err.errors,
+                    "day": first.get("day"),
+                },
+                transaction=tx,
+            )
+        except UnknownTargetError as err:
+            daemon.publish_bridge_response(
+                action,
+                {"status": "error", "code": "unknown_target", "error": str(err)},
+                transaction=tx,
+            )
+        except CloudError as err:
+            daemon.publish_bridge_response(
+                action,
+                {"status": "error", "code": "cloud_refused", "error": str(err)},
+                transaction=tx,
+            )
+        except ValueError as err:
+            daemon.publish_bridge_response(
+                action,
+                {"status": "error", "code": "invalid_request", "error": str(err)},
+                transaction=tx,
+            )
+
+    def _on_bridge_request(action: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         if action == "refresh":
             loop.call_soon_threadsafe(refresh_event.set)
             return {"refreshed": True}
+        if action in ("get_schedule", "set_schedule", "restore_schedule"):
+
+            def _spawn_req() -> None:
+                task = asyncio.create_task(_apply_bridge_request(action, payload))
+                pending_writes.add(task)
+                task.add_done_callback(pending_writes.discard)
+
+            loop.call_soon_threadsafe(_spawn_req)
+            return None
         raise ValueError(f"unsupported bridge request: {action}")
 
     daemon = StandaloneDanfoss2MqttDaemon(

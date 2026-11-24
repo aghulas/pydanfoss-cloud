@@ -662,3 +662,112 @@ def test_load_bridge_config_cloud_mqtt_listen_flag() -> None:
     assert load_bridge_config(args).cloud_mqtt_listen is True
     args_off = parser.parse_args([])
     assert load_bridge_config(args_off).cloud_mqtt_listen is False
+
+
+async def test_bridge_request_schedule_rpc_handlers() -> None:
+    """bridge/request/{get,set,restore}_schedule dispatch to CloudClient and correlate replies."""
+    from pydanfoss_cloud.client import CloudError, ScheduleValidationError, UnknownTargetError
+
+    transport = _MemTransport()
+    cloud_sched = {
+        "target": {"type": "room", "id": "grp1"},
+        "days": {"mon": [{"start": "08:00", "end": "18:00"}]},
+        "source": "cloud",
+    }
+    client = SimpleNamespace(
+        async_list_devices=AsyncMock(return_value=[]),
+        async_list_room_groups=AsyncMock(return_value=[]),
+        async_list_holidays=AsyncMock(return_value=[]),
+        async_get_schedule=AsyncMock(return_value=cloud_sched),
+        async_set_schedule_days=AsyncMock(return_value=None),
+        async_restore_schedule=AsyncMock(return_value=None),
+        async_close=AsyncMock(return_value=None),
+    )
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        async_run_bridge(
+            BridgeConfig(base_topic="danfoss2mqtt", poll_interval=30),
+            transport=transport,  # type: ignore[arg-type]
+            client=client,  # type: ignore[arg-type]
+            stop_event=stop_event,
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    def _reply(action: str, tx: str) -> dict[str, Any]:
+        matches = [
+            json.loads(p)
+            for t, p, _ in transport.published
+            if t == f"danfoss2mqtt/bridge/response/{action}"
+            and json.loads(p).get("transaction") == tx
+        ]
+        assert matches, f"missing reply for {action} tx={tx}"
+        return matches[-1]
+
+    try:
+        req = transport.subs["danfoss2mqtt/bridge/request/+"]
+        target = {"type": "room", "id": "grp1"}
+        days = {"mon": [{"start": "08:30", "end": "22:30"}]}
+
+        req(
+            "danfoss2mqtt/bridge/request/get_schedule",
+            json.dumps({"target": target, "transaction": "t1"}),
+        )
+        req(
+            "danfoss2mqtt/bridge/request/set_schedule",
+            json.dumps({"target": target, "days": days, "transaction": "t2"}),
+        )
+        req(
+            "danfoss2mqtt/bridge/request/restore_schedule",
+            json.dumps({"target": target, "transaction": "t3"}),
+        )
+        req(
+            "danfoss2mqtt/bridge/request/get_schedule",
+            json.dumps({"target": {"type": "device", "id": "d1"}, "transaction": "t4"}),
+        )
+        req(
+            "danfoss2mqtt/bridge/request/set_schedule",
+            json.dumps({"target": target, "days": "bad", "transaction": "t5"}),
+        )
+        await asyncio.sleep(0.05)
+
+        assert _reply("get_schedule", "t1") == {
+            "status": "ok",
+            "data": cloud_sched,
+            "transaction": "t1",
+        }
+        assert _reply("set_schedule", "t2")["status"] == "ok"
+        client.async_set_schedule_days.assert_awaited_once_with(target, days)
+        assert _reply("restore_schedule", "t3")["status"] == "ok"
+        client.async_restore_schedule.assert_awaited_once_with(target)
+        assert _reply("get_schedule", "t4")["code"] == "unknown_room"
+        assert _reply("set_schedule", "t5")["code"] == "invalid_request"
+
+        # Propagated errors
+        client.async_get_schedule.side_effect = UnknownTargetError("nope")
+        req(
+            "danfoss2mqtt/bridge/request/get_schedule",
+            json.dumps({"target": target, "transaction": "t6"}),
+        )
+        client.async_restore_schedule.side_effect = CloudError("rate")
+        req(
+            "danfoss2mqtt/bridge/request/restore_schedule",
+            json.dumps({"target": target, "transaction": "t7"}),
+        )
+        client.async_set_schedule_days.side_effect = ScheduleValidationError(
+            [{"code": "too_many_transitions", "message": "too many", "day": "mon"}]
+        )
+        req(
+            "danfoss2mqtt/bridge/request/set_schedule",
+            json.dumps({"target": target, "days": days, "transaction": "t8"}),
+        )
+        await asyncio.sleep(0.05)
+
+        assert _reply("get_schedule", "t6")["code"] == "unknown_target"
+        assert _reply("restore_schedule", "t7")["code"] == "cloud_refused"
+        r8 = _reply("set_schedule", "t8")
+        assert r8["code"] == "too_many_transitions" and r8["day"] == "mon"
+    finally:
+        stop_event.set()
+        await task
