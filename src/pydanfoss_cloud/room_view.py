@@ -13,22 +13,21 @@ The one model of §5: the coordinator keeps a desired state per room, derives pe
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 from .decode import DanfossDevice
-from .room_store import CoordinatorRoom, normalize_address
+from .room_store import CoordinatorHoliday, CoordinatorRoom, normalize_address
 from .rooms import Room, aggregate_room
 
 # Desired key -> DanfossDevice attribute that carries the head's REPORTED value for it.
-_DRIFT_ATTRS: dict[str, str] = {
+_SIMPLE_DRIFT_ATTRS: dict[str, str] = {
     "setpoint": "setpoint",
-    "mode": "mode",
     "max_setpoint": "max_setpoint",
     "min_setpoint": "min_setpoint",
     "child_lock": "child_lock",
     "window_detection": "window_detection",
-    "preheat": "preheat",
 }
 
 # Heat-demand message validity: a consumer treats an older (or missing) message as "unknown"
@@ -39,9 +38,44 @@ DEFAULT_HEAT_DEMAND_VALID_S = 900
 def _values_differ(desired: Any, reported: Any) -> bool:
     if reported is None:
         return False  # not reported yet -> not counted as drift
-    if isinstance(desired, (int, float)) and isinstance(reported, (int, float)):
+    if (
+        isinstance(desired, (int, float))
+        and not isinstance(desired, bool)
+        and isinstance(reported, (int, float))
+        and not isinstance(reported, bool)
+    ):
         return abs(float(desired) - float(reported)) > 0.1
     return desired != reported
+
+
+def member_drift_keys(room: CoordinatorRoom, dev: DanfossDevice) -> list[str]:
+    """Return the desired keys for which ``dev``'s reported state differs from ``room.desired``."""
+    if not room.desired:
+        return []
+    drifting: list[str] = []
+    for key, attr in _SIMPLE_DRIFT_ATTRS.items():
+        if key in room.desired and _values_differ(room.desired[key], getattr(dev, attr, None)):
+            drifting.append(key)
+
+    desired_mode = room.desired.get("mode")
+    if isinstance(desired_mode, str) and desired_mode:
+        norm_mode = desired_mode.strip().lower()
+        if dev.schedule_active is not None:
+            want_schedule = norm_mode == "schedule"
+            if dev.schedule_active is not want_schedule:
+                drifting.append("mode")
+        elif dev.mode is not None and dev.mode.strip().lower() != norm_mode:
+            drifting.append("mode")
+
+    if (
+        "preheat" in room.desired
+        and str(room.desired.get("mode") or "schedule").strip().lower() == "schedule"
+        and dev.preheat is not None
+        and bool(room.desired["preheat"]) is not bool(dev.preheat)
+    ):
+        drifting.append("preheat")
+
+    return drifting
 
 
 def _drift_members(room: CoordinatorRoom, members: list[DanfossDevice]) -> list[str]:
@@ -52,12 +86,8 @@ def _drift_members(room: CoordinatorRoom, members: list[DanfossDevice]) -> list[
     drifting: list[str] = []
     for addr in room.members:
         dev = by_norm.get(normalize_address(addr))
-        if dev is None:
-            continue
-        for key, attr in _DRIFT_ATTRS.items():
-            if key in room.desired and _values_differ(room.desired[key], getattr(dev, attr, None)):
-                drifting.append(addr)
-                break
+        if dev is not None and member_drift_keys(room, dev):
+            drifting.append(addr)
     return drifting
 
 
@@ -65,6 +95,8 @@ def build_room_view(
     room: CoordinatorRoom,
     members: list[DanfossDevice],
     sensor: DanfossDevice | None = None,
+    *,
+    reconcile_blocked: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build one ``bridge/rooms`` object for a room from its reported members (+ optional sensor).
 
@@ -112,7 +144,42 @@ def build_room_view(
         "schedule": room.schedule,
         "desired": dict(room.desired),
         "drift": _drift_members(room, members),
+        "reconcile_blocked": list(reconcile_blocked),
     }
+
+
+def build_holidays_view(
+    holidays: Sequence[CoordinatorHoliday],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Serialize coordinator holidays into the retained ``bridge/holidays`` dict shape."""
+    current = now or datetime.now().astimezone()
+    out: dict[str, Any] = {}
+    for hol in holidays:
+        scheduled = False
+        try:
+            start_dt = datetime.fromisoformat(hol.start)
+            end_dt = datetime.fromisoformat(hol.end)
+            if start_dt.tzinfo is None and current.tzinfo is not None:
+                start_dt = start_dt.replace(tzinfo=current.tzinfo)
+            if end_dt.tzinfo is None and current.tzinfo is not None:
+                end_dt = end_dt.replace(tzinfo=current.tzinfo)
+            scheduled = current < end_dt and not hol.active and current < start_dt
+        except ValueError:
+            scheduled = False
+        out[hol.holiday_id] = {
+            "name": hol.name,
+            "active": hol.active,
+            "scheduled": scheduled,
+            "detail": {
+                "start": hol.start,
+                "end": hol.end,
+                "temperature": hol.temperature,
+                "rooms": list(hol.room_ids),
+            },
+        }
+    return out
 
 
 def _room_calls_for_heat(members: list[DanfossDevice]) -> tuple[bool, float]:

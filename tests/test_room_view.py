@@ -102,3 +102,33 @@ def test_heat_demand_empty() -> None:
     assert hd["calling"] is False
     assert hd["rooms_calling"] == []
     assert hd["max_valve"] == 0.0
+
+
+def test_drift_mode_and_preheat_on_z2m_heads() -> None:
+    room = CoordinatorRoom(
+        room_id="r1",
+        name="Living",
+        prefix="zigbee2mqtt",
+        members=("0xA", "0xB"),
+        desired={"mode": "schedule", "preheat": True},
+    )
+    members = [
+        _head("0xA", schedule_active=True, preheat=True),
+        _head("0xB", schedule_active=False, preheat=False),
+    ]
+    view = build_room_view(room, members, reconcile_blocked=["0xB"])
+    assert view["drift"] == ["0xB"]
+    assert view["reconcile_blocked"] == ["0xB"]
+
+    # In manual/pause mode, preheat=False reported by head must not trigger preheat drift.
+    paused_room = CoordinatorRoom(
+        room_id="r1",
+        name="Living",
+        prefix="zigbee2mqtt",
+        members=("0xA",),
+        desired={"mode": "pause", "preheat": True},
+    )
+    assert (
+        build_room_view(paused_room, [_head("0xA", schedule_active=False, preheat=False)])["drift"]
+        == []
+    )

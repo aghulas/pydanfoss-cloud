@@ -207,3 +207,67 @@ def test_fanout_no_retries_single_attempt() -> None:
         retries=0,
     )
     assert len(log) == 1
+
+
+def test_stage4_to_7_validators() -> None:
+    from pydanfoss_cloud.write_job import (
+        HolidayValidationError,
+        ScheduleWriteValidationError,
+        SettingsValidationError,
+        build_z2m_schedule_payloads,
+        validate_holiday,
+        validate_room_settings,
+    )
+
+    # Full 7-day fill + day alias support
+    canon, payloads = build_z2m_schedule_payloads(
+        {"monday": [{"start": "07:00", "end": "09:00"}]}, 21.0, 17.0
+    )
+    assert len(payloads) == 7
+    assert canon["mon"] == [{"start": "07:00", "end": "09:00"}]
+    assert canon["tue"] == []
+
+    # Invalid day rejected before building payloads
+    try:
+        build_z2m_schedule_payloads({"funday": []}, 21.0, 17.0)
+        raise AssertionError("expected ScheduleWriteValidationError")
+    except ScheduleWriteValidationError:
+        pass
+
+    # Settings validation rejects min > max and bad types
+    try:
+        validate_room_settings({"min_setpoint": 25.0, "max_setpoint": 20.0}, [_head("a")])
+        raise AssertionError("expected SettingsValidationError")
+    except SettingsValidationError:
+        pass
+
+    try:
+        validate_room_settings({"child_lock": "yes"}, [_head("a")])
+        raise AssertionError("expected SettingsValidationError")
+    except SettingsValidationError:
+        pass
+
+    # Holiday validation rejects reversed dates and unknown room
+    try:
+        validate_holiday(
+            start="2026-12-24T10:00:00+01:00",
+            end="2026-12-20T10:00:00+01:00",
+            temperature=12.0,
+            room_ids=["r1"],
+            known_room_ids={"r1"},
+        )
+        raise AssertionError("expected HolidayValidationError")
+    except HolidayValidationError:
+        pass
+
+    try:
+        validate_holiday(
+            start="2026-12-20T10:00:00+01:00",
+            end="2026-12-24T10:00:00+01:00",
+            temperature=12.0,
+            room_ids=["missing"],
+            known_room_ids={"r1"},
+        )
+        raise AssertionError("expected HolidayValidationError")
+    except HolidayValidationError:
+        pass

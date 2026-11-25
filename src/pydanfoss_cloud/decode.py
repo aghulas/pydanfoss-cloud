@@ -189,8 +189,14 @@ class DanfossDevice:
     battery: float | None = None  # % (DP 34)
     valve_opening: float | None = None  # % (DP 170 pi_heating_demand)
     load_estimate: int | None = None  # raw Danfoss radiator load estimate (int16, DP 108 / 0x404A)
+    # Zigbee2MQTT `load_balancing_enable` (head acts on `load_room_mean`); None = not reported
+    load_balancing_enable: bool | None = None
+    # Zigbee2MQTT `radiator_covered` (True = room-sensor mode, False = offset mode); None = unknown
+    radiator_covered: bool | None = None
     heat_request: bool | None = None  # DP 162 heat_supply_request
     window_open: bool | None = None  # DP 25 window_state
+    # Raw Zigbee2MQTT `window_open_internal` enum (e.g. "open", "external_open", "closed")
+    window_open_internal: str | None = None
     window_detection: bool | None = None  # DP 116 window_toggle
     child_lock: bool | None = None  # DP 30 child_lock
     max_setpoint: float | None = None  # °C (DP 18)
