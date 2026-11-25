@@ -102,21 +102,88 @@ def _new_room_id() -> str:
     return f"room-{secrets.token_hex(4)}"
 
 
-class RoomStore:
-    """In-memory room map backed by a JSON file. All mutators persist on success.
+def _new_holiday_id() -> str:
+    return f"holiday-{secrets.token_hex(4)}"
 
-    Not thread-safe by itself: the coordinator calls it from one place (the request handler).
+
+@dataclass(frozen=True)
+class CoordinatorHoliday:
+    """One coordinator-managed holiday entry (``docs/z2m-cloud-parity.md`` §5.4, Stage 7).
+
+    - ``start`` and ``end`` are ISO-8601 datetime strings.
+    - ``temperature`` is the held away setpoint (°C).
+    - ``room_ids`` lists the targeted coordinator rooms.
+    - ``active`` records whether the coordinator has entered the holiday period (persisted so a
+      missed end edge while stopped is reconciled immediately on restart).
+    - ``saved_modes`` records each room's mode before the holiday started.
+    """
+
+    holiday_id: str
+    start: str
+    end: str
+    temperature: float
+    room_ids: tuple[str, ...] = ()
+    name: str = "Holiday"
+    active: bool = False
+    saved_modes: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "holiday_id": self.holiday_id,
+            "name": self.name,
+            "start": self.start,
+            "end": self.end,
+            "temperature": self.temperature,
+            "room_ids": list(self.room_ids),
+            "active": self.active,
+            "saved_modes": dict(self.saved_modes),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> CoordinatorHoliday:
+        hid = str(raw.get("holiday_id") or "").strip()
+        start = str(raw.get("start") or "").strip()
+        end = str(raw.get("end") or "").strip()
+        if not hid or not start or not end:
+            raise RoomStoreError("a stored holiday needs holiday_id, start and end")
+        try:
+            temp = float(raw["temperature"])
+        except (KeyError, TypeError, ValueError) as err:
+            raise RoomStoreError(f"holiday {hid!r} needs a numeric temperature") from err
+        room_ids = tuple(str(r).strip() for r in (raw.get("room_ids") or []) if str(r).strip())
+        saved = raw.get("saved_modes")
+        saved_modes = (
+            {str(k): str(v) for k, v in saved.items()} if isinstance(saved, Mapping) else {}
+        )
+        return cls(
+            holiday_id=hid,
+            name=str(raw.get("name") or "Holiday").strip() or "Holiday",
+            start=start,
+            end=end,
+            temperature=temp,
+            room_ids=room_ids,
+            active=bool(raw.get("active", False)),
+            saved_modes=saved_modes,
+        )
+
+
+class RoomStore:
+    """In-memory room & holiday map backed by a JSON file. All mutators persist on success.
+
+    Not thread-safe by itself: the coordinator calls it under its lock.
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
         self._path: Path | None = Path(path) if path is not None else None
         self._rooms: dict[str, CoordinatorRoom] = {}
+        self._holidays: dict[str, CoordinatorHoliday] = {}
 
     # --- persistence ---------------------------------------------------------------------------
 
     def load(self) -> RoomStore:
         """Load from disk if the file exists; an absent or empty file is an empty store."""
         self._rooms = {}
+        self._holidays = {}
         if self._path is None or not self._path.exists():
             return self
         raw = self._path.read_text(encoding="utf-8").strip()
@@ -128,6 +195,11 @@ class RoomStore:
             if isinstance(entry, Mapping):
                 room = CoordinatorRoom.from_dict(entry)
                 self._rooms[room.room_id] = room
+        holidays = data.get("holidays", []) if isinstance(data, Mapping) else []
+        for entry in holidays:
+            if isinstance(entry, Mapping):
+                hol = CoordinatorHoliday.from_dict(entry)
+                self._holidays[hol.holiday_id] = hol
         return self
 
     def save(self) -> None:
@@ -135,7 +207,12 @@ class RoomStore:
         if self._path is None:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": STORE_VERSION, "rooms": [r.to_dict() for r in self._rooms.values()]}
+        payload: dict[str, Any] = {
+            "version": STORE_VERSION,
+            "rooms": [r.to_dict() for r in self._rooms.values()],
+        }
+        if self._holidays:
+            payload["holidays"] = [h.to_dict() for h in self._holidays.values()]
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self._path)
@@ -213,16 +290,31 @@ class RoomStore:
         self.save()
         return room
 
-    def update_desired(self, room_id: str, changes: Mapping[str, Any]) -> CoordinatorRoom:
-        """Merge ``changes`` into a room's ``desired`` state and persist (§5, "what was asked").
+    def update_desired(
+        self,
+        room_id: str,
+        changes: Mapping[str, Any],
+        *,
+        remove_keys: Iterable[str] = (),
+    ) -> CoordinatorRoom:
+        """Merge ``changes`` (and drop ``remove_keys``) on ``room.desired`` and persist (§5).
 
         The desired state is what a write stage *asked* for; the ``drift`` view compares it to what
         the heads **report**. Seeding it does not touch a head — it is a definition update only.
         """
         room = self.get(room_id)
         desired = dict(room.desired)
+        for key in remove_keys:
+            desired.pop(key, None)
         desired.update(changes)
         room = replace(room, desired=desired)
+        self._rooms[room_id] = room
+        self.save()
+        return room
+
+    def set_schedule(self, room_id: str, schedule: Mapping[str, Any] | None) -> CoordinatorRoom:
+        """Persist a room's weekly schedule definition and return the updated room."""
+        room = replace(self.get(room_id), schedule=dict(schedule) if schedule is not None else None)
         self._rooms[room_id] = room
         self.save()
         return room
@@ -230,6 +322,78 @@ class RoomStore:
     def delete(self, room_id: str) -> None:
         self.get(room_id)  # raise if unknown
         del self._rooms[room_id]
+        self.save()
+
+    # --- holidays (Stage 7) --------------------------------------------------------------------
+
+    def holidays(self) -> list[CoordinatorHoliday]:
+        return list(self._holidays.values())
+
+    def get_holiday(self, holiday_id: str) -> CoordinatorHoliday:
+        try:
+            return self._holidays[holiday_id]
+        except KeyError:
+            raise RoomStoreError(f"unknown holiday {holiday_id!r}") from None
+
+    def upsert_holiday(
+        self,
+        *,
+        start: str,
+        end: str,
+        temperature: float,
+        room_ids: Iterable[str],
+        name: str = "Holiday",
+        holiday_id: str | None = None,
+        active: bool | None = None,
+        saved_modes: Mapping[str, str] | None = None,
+    ) -> CoordinatorHoliday:
+        hid = (holiday_id or "").strip() or _new_holiday_id()
+        existing = self._holidays.get(hid)
+        rooms = tuple(str(r).strip() for r in room_ids if str(r).strip())
+        if not rooms:
+            raise RoomStoreError("a holiday requires at least one room_id")
+        for rid in rooms:
+            self.get(rid)  # verify every room exists
+        hol = CoordinatorHoliday(
+            holiday_id=hid,
+            name=(name or "Holiday").strip() or "Holiday",
+            start=start,
+            end=end,
+            temperature=float(temperature),
+            room_ids=rooms,
+            active=existing.active if active is None and existing is not None else bool(active),
+            saved_modes=(
+                dict(existing.saved_modes)
+                if saved_modes is None and existing is not None
+                else dict(saved_modes or {})
+            ),
+        )
+        self._holidays[hid] = hol
+        self.save()
+        return hol
+
+    def update_holiday_state(
+        self,
+        holiday_id: str,
+        *,
+        active: bool,
+        saved_modes: Mapping[str, str] | None = None,
+    ) -> CoordinatorHoliday:
+        existing = self.get_holiday(holiday_id)
+        hol = replace(
+            existing,
+            active=active,
+            saved_modes=(
+                dict(saved_modes) if saved_modes is not None else dict(existing.saved_modes)
+            ),
+        )
+        self._holidays[holiday_id] = hol
+        self.save()
+        return hol
+
+    def delete_holiday(self, holiday_id: str) -> None:
+        self.get_holiday(holiday_id)  # raise if unknown
+        del self._holidays[holiday_id]
         self.save()
 
     # --- helpers -------------------------------------------------------------------------------

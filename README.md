@@ -31,12 +31,29 @@ its **own** prefix, and answers `bridge/request/room/*` (`docs/z2m-cloud-parity.
 danfoss-room-coordinator --source-prefix zigbee2mqtt --base-topic danfoss-rooms --store-path rooms.json
 ```
 
-### Setpoint fan-out (closed by default)
+### Write stages 2–7 (closed by default)
 
-A room setpoint change (`bridge/request/room/set-setpoint`) is a **fan-out of one `/set` per head**,
-each confirmed on that head's own state topic (`docs/z2m-cloud-parity.md` §5.2). It is
-**closed by default**: nothing is written unless the room is explicitly **armed**. An unarmed room
-is refused and nothing is sent — the coordinator stays read-only.
+Every write stage is **closed by default**:
+
+- **Room allowlist (`armed_rooms`, empty by default)**: no head receives any `/set` unless its
+  `room_id` is listed (`--armed-room <room_id>`, `DANFOSS_ARMED_ROOMS`, or `options.json`).
+  Requests targeting an unarmed room (`room/set-setpoint`, `room/set-schedule`, `room/set-mode`,
+  `room/set-comfort-setback`, `room/restore-schedule`, `room/set-settings`) are refused with
+  `status: "closed"`.
+- **Per-stage opt-in flags (all `False` by default)**:
+  - `--feed-external-sensor` (`DANFOSS_FEED_EXTERNAL_SENSOR`): Stage 3 event-driven room sensor
+    feed (both `radiator_covered` modes, 30-min silence -> `-8000`).
+  - `--mode-change-keeps-schedule` (`DANFOSS_MODE_CHANGE_KEEPS_SCHEDULE`): Stage 4 flag once a
+    real-hardware trial confirms `programming_operation_mode=setpoint` keeps the ZCL schedule
+    (when `False`, returning to `schedule` rewrites all 7 days).
+  - `--reconcile-drift` (`DANFOSS_RECONCILE_DRIFT`): Stage 5 hourly drift reconciliation (capped at
+    3 consecutive attempts, then flagged `reconcile_blocked`).
+  - `--feed-load-mean` (`DANFOSS_FEED_LOAD_MEAN`): Stage 6 multi-head `load_room_mean` (coalesced
+    with the sensor feed into one `/set` per head, `-8000` on clean stop).
+  - `--enable-holidays` (`DANFOSS_ENABLE_HOLIDAYS`): Stage 7 holiday edge automation (reconciled
+    at startup and on ticks; publishes `bridge/holidays`).
+  - `--propagate-window-open` (`DANFOSS_PROPAGATE_WINDOW_OPEN`): Stage 7 cross-room
+    `window_open_external` propagation with max-duration cap.
 
 Arm a room only for a supervised real-hardware trial, by its `room_id`:
 

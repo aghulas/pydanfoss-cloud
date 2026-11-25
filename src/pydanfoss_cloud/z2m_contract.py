@@ -284,12 +284,19 @@ def decode_z2m_state(
         raw_le = payload["load_estimate"]
         if raw_le is None:
             dev.load_estimate = None
-        else:
+        elif not isinstance(raw_le, bool):
             try:
                 le = int(raw_le)
                 dev.load_estimate = None if le == -8000 else le
             except (ValueError, TypeError):
                 pass
+    if "load_balancing_enable" in payload:
+        # Strict: only a real boolean counts; anything else leaves the head "not reported".
+        lbe = payload["load_balancing_enable"]
+        dev.load_balancing_enable = lbe if isinstance(lbe, bool) else None
+    if "radiator_covered" in payload:
+        rc = payload["radiator_covered"]
+        dev.radiator_covered = rc if isinstance(rc, bool) else None
     if "running_state" in payload and isinstance(payload["running_state"], str):
         rs = payload["running_state"].strip().lower()
         dev.state = "Heat" if rs in ("heat", "heating") else "NoHeat"
@@ -298,12 +305,16 @@ def decode_z2m_state(
 
     if "window_open" in payload and isinstance(payload["window_open"], bool):
         dev.window_open = payload["window_open"]
+        dev.window_open_internal = None
     elif "window_open_internal" in payload:
         wi = payload["window_open_internal"]
         if isinstance(wi, bool):
             dev.window_open = wi
+            dev.window_open_internal = "open" if wi else "closed"
         elif isinstance(wi, str):
-            dev.window_open = wi.strip().lower() in ("open", "external_open")
+            norm_wi = wi.strip().lower()
+            dev.window_open_internal = norm_wi
+            dev.window_open = norm_wi in ("open", "external_open")
 
     if "window_open_feature" in payload and payload["window_open_feature"] is not None:
         dev.window_detection = bool(payload["window_open_feature"])

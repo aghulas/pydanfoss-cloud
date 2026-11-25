@@ -105,3 +105,32 @@ def test_pathless_store_does_not_persist() -> None:
     store = RoomStore()
     store.create("Living", "zigbee2mqtt")  # save() is a no-op, must not raise
     assert len(store) == 1
+
+
+def test_schedule_desired_remove_and_holiday_round_trip(tmp_path) -> None:
+    path = tmp_path / "rooms.json"
+    store = RoomStore(path)
+    store.create("Living", "zigbee2mqtt", members=["0xA"], room_id="r1")
+    store.set_schedule("r1", {"comfort": 21.0, "setback": 17.0, "days": {"mon": []}})
+    store.update_desired("r1", {"mode": "pause", "setpoint": 15.0})
+    store.update_desired("r1", {"mode": "schedule"}, remove_keys=("setpoint",))
+    hol = store.upsert_holiday(
+        holiday_id="h1",
+        name="Winter",
+        start="2026-12-21T08:00:00+01:00",
+        end="2026-12-24T18:00:00+01:00",
+        temperature=12.0,
+        room_ids=["r1"],
+    )
+    assert hol.active is False
+    store.update_holiday_state("h1", active=True, saved_modes={"r1": "schedule"})
+
+    reloaded = RoomStore(path).load()
+    room = reloaded.get("r1")
+    assert room.schedule == {"comfort": 21.0, "setback": 17.0, "days": {"mon": []}}
+    assert room.desired == {"mode": "schedule"}
+    hol2 = reloaded.get_holiday("h1")
+    assert hol2.active is True
+    assert hol2.saved_modes == {"r1": "schedule"}
+    reloaded.delete_holiday("h1")
+    assert reloaded.holidays() == []
