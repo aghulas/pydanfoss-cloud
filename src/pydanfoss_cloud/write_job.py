@@ -369,7 +369,6 @@ def build_z2m_schedule_payloads(
                 "weekly_schedule": {
                     "dayofweek": _Z2M_DAY_BITS[day],
                     "num_of_transitions": len(transitions),
-                    "mode": 1,
                     "transitions": transitions,
                 }
             }
