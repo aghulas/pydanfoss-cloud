@@ -237,17 +237,7 @@ _DAY_ALIASES: dict[str, str] = {
     "sat": "sat", "saturday": "sat",
 }  # fmt: skip
 
-_Z2M_DAY_BITS: dict[str, int] = {
-    "sun": 0x01,
-    "mon": 0x02,
-    "tue": 0x04,
-    "wed": 0x08,
-    "thu": 0x10,
-    "fri": 0x20,
-    "sat": 0x40,
-}
-
-# Zigbee2MQTT converter day names for optional ``schedule_<day>`` read-back verification.
+# Zigbee2MQTT converter day names for ``weekly_schedule`` writes & ``schedule_<day>`` reads.
 Z2M_SCHEDULE_DAY_NAMES: dict[str, str] = {
     "mon": "monday",
     "tue": "tuesday",
@@ -367,8 +357,8 @@ def build_z2m_schedule_payloads(
         payloads.append(
             {
                 "weekly_schedule": {
-                    "dayofweek": _Z2M_DAY_BITS[day],
-                    "num_of_transitions": len(transitions),
+                    # zhc >= 26 needs a list of day names (int bitmask silently maps to 0).
+                    "dayofweek": [Z2M_SCHEDULE_DAY_NAMES[day]],
                     "transitions": transitions,
                 }
             }
