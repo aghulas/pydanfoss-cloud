@@ -456,6 +456,86 @@ def test_publish_fleet_rooms_payload_shape() -> None:
     assert json.loads(hol_pub[-1]) == {"home9": {"active": True}}
 
 
+def _sensor(dev_id: str = "sens_1", name: str = "Salle 101") -> DanfossDevice:
+    return DanfossDevice(
+        id=dev_id, name=name, category="sensor", online=True, temperature=19.5, humidity=40.0
+    )
+
+
+def test_unique_friendly_names_head_keeps_its_name() -> None:
+    names = bridge_daemon.unique_friendly_names(
+        [
+            _sensor("sens_1", "Salle 101"),
+            _head("dev_1", "Salle 101"),
+            _head("dev_2", "Salle 102"),
+            _sensor("sens_9", "Preau"),
+        ]
+    )
+    assert names == {
+        "dev_1": "Salle 101",  # the head keeps the topic that takes writes
+        "sens_1": "Salle 101 (sensor)",
+        "dev_2": "Salle 102",
+        "sens_9": "Preau",  # used once: untouched
+    }
+    assert len(set(names.values())) == len(names)
+
+
+def test_unique_friendly_names_same_category_and_existing_suffix() -> None:
+    names = bridge_daemon.unique_friendly_names(
+        [
+            _head("dev_b222", "Hall"),
+            _head("dev_a111", "Hall"),
+            _sensor("sens_1", "Hall"),
+            _sensor("sens_2", "Hall (sensor)"),  # already holds the suffixed name
+        ]
+    )
+    assert names["dev_a111"] == "Hall"  # first by id keeps the bare name
+    assert names["dev_b222"] == "Hall (head)"
+    assert names["sens_2"] == "Hall (sensor)"
+    assert names["sens_1"] == "Hall (sensor) ns_1"
+    assert len(set(names.values())) == 4
+
+
+def test_same_named_head_and_sensor_do_not_share_a_topic() -> None:
+    """Regression (real install, 2026-11-27): a room sensor and the single head of its room had
+    the same name, hence the same topic: the sensor read as a head and had no temperature."""
+    transport = _MemTransport()
+    routed: list[str] = []
+    daemon = StandaloneDanfoss2MqttDaemon(
+        transport,  # type: ignore[arg-type]
+        base_topic="danfoss2mqtt",
+        on_device_set=lambda dev, _payload: routed.append(dev.id),
+    )
+    daemon.start()
+    head, sensor = _head("dev_1", "Salle 101"), _sensor("sens_1", "Salle 101")
+    for devices in ([head, sensor], [sensor, head]):  # whatever the poll order
+        transport.published.clear()
+        daemon.publish_fleet(devices)
+        states = {t: json.loads(p) for t, p, _ in transport.published if not t.endswith("y")}
+        assert "local_temperature" in states["danfoss2mqtt/Salle 101"]
+        assert states["danfoss2mqtt/Salle 101 (sensor)"]["humidity"] == 40.0
+        descriptors = json.loads(
+            next(p for t, p, _ in transport.published if t == "danfoss2mqtt/bridge/devices")
+        )
+        assert sorted(d["friendly_name"] for d in descriptors) == [
+            "Salle 101",
+            "Salle 101 (sensor)",
+        ]
+        # A /set on the shared name reaches the head, never the sensor.
+        routed.clear()
+        transport.subs["danfoss2mqtt/+/set"](
+            "danfoss2mqtt/Salle 101/set", json.dumps({"occupied_heating_setpoint": 20.0})
+        )
+        assert routed == ["dev_1"]
+    # A later single-device publish keeps the device on its own topic.
+    transport.published.clear()
+    daemon.publish_device(sensor)
+    assert {t for t, _, _ in transport.published} == {
+        "danfoss2mqtt/Salle 101 (sensor)",
+        "danfoss2mqtt/Salle 101 (sensor)/availability",
+    }
+
+
 def _relay(dev_id: str = "relay_1", name: str = "Relais") -> DanfossDevice:
     return DanfossDevice(id=dev_id, name=name, category="relay", online=True, relay_on=True)
 
