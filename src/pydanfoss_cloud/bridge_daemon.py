@@ -297,12 +297,17 @@ class StandaloneDanfoss2MqttDaemon:
         local_attrs: dict[str, dict[str, Any]] | None = None,
         holidays: dict[str, Any] | None = None,
         device_home: dict[str, str] | None = None,
+        relays: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
-        """Publish ``bridge/devices``, ``bridge/rooms``, ``bridge/holidays`` and all device states.
+        """Publish ``bridge/devices``, ``bridge/rooms``, ``bridge/holidays``, ``bridge/relays`` and
+        all device states.
 
-        All four topics are retained. ``rooms``/``holidays`` left as ``None`` leave the matching
-        topic untouched this cycle (its retained value stands); an empty list/dict is published as
-        such so the topic appears on the broker.
+        All these topics are retained. ``rooms``/``holidays``/``relays`` left as ``None`` leave the
+        matching topic untouched this cycle (its retained value stands); an empty list/dict is
+        published as such so the topic appears on the broker.
+
+        ``relays`` maps a boiler relay's device id to the rooms eligible to drive it,
+        ``[{"room_id", "name", "linked"}]`` (the relay's own on/off is on its device topic).
         """
         self._devices = {d.id: d for d in devices}
         if local_attrs is not None:
@@ -355,6 +360,13 @@ class StandaloneDanfoss2MqttDaemon:
             self._transport.publish(
                 f"{self._base}/bridge/holidays",
                 json.dumps(holidays),
+                retain=True,
+            )
+
+        if relays is not None:
+            self._transport.publish(
+                f"{self._base}/bridge/relays",
+                json.dumps(relays),
                 retain=True,
             )
 
@@ -593,6 +605,61 @@ async def _build_holidays(client: CloudClient) -> dict[str, Any] | None:
         _LOGGER.warning("danfoss2mqtt: could not read holidays this cycle", exc_info=True)
         return None
     return {str(h["gid"]): h for h in items if h.get("gid") is not None}
+
+
+# The relay -> room linkage is account configuration, changed by hand in the app and rarely: it is
+# re-read at most this often (one request per relay), not on every poll cycle.
+RELAY_LINKS_TTL_SECONDS = 3600.0
+
+
+class RelayLinks:
+    """Boiler relays' room linkage for ``bridge/relays``, read sparingly from the cloud.
+
+    One ``async_relay_rooms`` request per relay, at most every ``RELAY_LINKS_TTL_SECONDS`` (or at
+    once when a relay appears). A relay whose read fails keeps its previous rooms and is retried on
+    the next cycle; a relay gone from the fleet is dropped. Read only.
+    """
+
+    def __init__(self, ttl: float = RELAY_LINKS_TTL_SECONDS) -> None:
+        self._ttl = ttl
+        self._rooms: dict[str, list[dict[str, Any]]] = {}
+        self._read_at: dict[str, float] = {}
+
+    async def read(
+        self, client: CloudClient, devices: list[DanfossDevice]
+    ) -> dict[str, list[dict[str, Any]]] | None:
+        """Current linkage keyed by relay id, or ``None`` when nothing is known yet.
+
+        ``None`` leaves ``bridge/relays`` untouched (no relay read succeeded so far); a fleet
+        without any relay yields ``{}`` so the topic is published empty.
+        """
+        relay_ids = [d.id for d in devices if d.is_relay]
+        for gone in set(self._rooms) - set(relay_ids):
+            self._rooms.pop(gone, None)
+            self._read_at.pop(gone, None)
+        now = time.monotonic()
+        for relay_id in relay_ids:
+            last = self._read_at.get(relay_id)
+            if last is not None and now - last < self._ttl:
+                continue
+            try:
+                rooms = await client.async_relay_rooms(relay_id)
+            except CloudError:
+                _LOGGER.warning("danfoss2mqtt: could not read a relay's rooms this cycle")
+                continue
+            self._rooms[relay_id] = [
+                {
+                    "room_id": str(r.get("room_id")),
+                    "name": r.get("name"),
+                    "linked": bool(r.get("linked")),
+                }
+                for r in rooms
+                if isinstance(r, dict) and r.get("room_id") is not None
+            ]
+            self._read_at[relay_id] = now
+        if relay_ids and not self._rooms:
+            return None
+        return {rid: list(rooms) for rid, rooms in self._rooms.items()}
 
 
 async def build_cloud_mqtt_listener(
@@ -875,15 +942,23 @@ async def async_run_bridge(
             _LOGGER.exception("danfoss2mqtt: cloud-MQTT listener setup failed")
             cloud_link = None
 
+    relay_links = RelayLinks()
     try:
         while not stop.is_set():
             try:
                 devices = await client.async_list_devices()
                 rooms = await _build_rooms(client, devices)
                 holidays = await _build_holidays(client)
+                relays = await relay_links.read(client, devices)
                 raw_home = getattr(client, "device_home", None)
                 dev_home = raw_home if isinstance(raw_home, dict) else None
-                daemon.publish_fleet(devices, rooms=rooms, holidays=holidays, device_home=dev_home)
+                daemon.publish_fleet(
+                    devices,
+                    rooms=rooms,
+                    holidays=holidays,
+                    device_home=dev_home,
+                    relays=relays,
+                )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("danfoss2mqtt: poll cycle failed")
 
