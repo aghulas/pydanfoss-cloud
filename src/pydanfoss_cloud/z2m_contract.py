@@ -31,6 +31,35 @@ def clean_friendly_name(name: str, fallback: str = "") -> str:
     return raw
 
 
+# Danfoss window-open state (Zigbee attribute 0x4000, also pushed by the cloud as DP 199) as
+# Zigbee2MQTT names it on ``window_open_internal``.
+WINDOW_OPEN_INTERNAL_TEXT: dict[int, str] = {
+    0: "quarantine",
+    1: "closed",
+    2: "hold",
+    3: "open",
+    4: "external_open",
+}
+
+
+def window_open_internal_text(raw: Any) -> str | None:
+    """Zigbee2MQTT's ``window_open_internal`` text for a raw window state, or None if unknown.
+
+    The local tunnel and the cloud push give the attribute's integer (1 = closed); Zigbee2MQTT
+    publishes the enum's name, which is what a consumer of this dialect expects. A value already
+    in text is passed through when it is one of the names; anything else is dropped rather than
+    published as a number nobody decodes.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return WINDOW_OPEN_INTERNAL_TEXT.get(raw)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        return low if low in WINDOW_OPEN_INTERNAL_TEXT.values() else None
+    return None
+
+
 def programming_mode_to_z2m(schedule_active: bool | None, preheat: bool | None) -> str | None:
     """Map ``(schedule_active, preheat)`` (DP 172 bits 0 & 1 / tunnel 0x0025) to Z2M's enum."""
     if schedule_active is None:
@@ -160,10 +189,12 @@ def encode_z2m_state(
             ("descale_day", "day_of_week"),
             ("descale_time", "trigger_time"),
             ("adaptation_run", "adaptation_run_status"),
-            ("window_state", "window_open_internal"),
         ):
             if local_attrs.get(src_key) is not None:
                 out[z2m_key] = local_attrs[src_key]
+        window = window_open_internal_text(local_attrs.get("window_state"))
+        if window is not None:
+            out["window_open_internal"] = window
 
     ext: dict[str, Any] = {}
     if dev.setpoints:
@@ -452,4 +483,5 @@ __all__ = [
     "encode_z2m_state",
     "programming_mode_from_z2m",
     "programming_mode_to_z2m",
+    "window_open_internal_text",
 ]

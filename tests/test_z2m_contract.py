@@ -307,3 +307,31 @@ def test_decode_z2m_2x_string_enums_from_real_hardware() -> None:
     assert head.child_lock is True
     assert head.viewing_direction is True
     assert head.orientation == "Vertical"
+
+
+def test_window_open_internal_is_published_as_zigbee2mqtt_text() -> None:
+    """Regression (real install, 2026-11-27): the cloud push gives the raw window state (1 =
+    closed) and the bridge published ``window_open_internal: 1``. Zigbee2MQTT publishes the name."""
+    from pydanfoss_cloud.z2m_contract import window_open_internal_text
+
+    assert [window_open_internal_text(i) for i in range(5)] == [
+        "quarantine",
+        "closed",
+        "hold",
+        "open",
+        "external_open",
+    ]
+    assert window_open_internal_text("Open") == "open"
+    for junk in (None, True, 9, "ajar", 1.0):
+        assert window_open_internal_text(junk) is None
+
+    src = _sample_head()
+    assert encode_z2m_state(src, local_attrs={"window_state": 1})["window_open_internal"] == (
+        "closed"
+    )
+    assert encode_z2m_state(src, local_attrs={"window_state": 3})["window_open_internal"] == "open"
+    assert "window_open_internal" not in encode_z2m_state(src, local_attrs={"window_state": 7})
+    # Decoded back, a published "open" reads as an open window; "closed" as a closed one.
+    head = _sample_head()
+    decode_z2m_state(head, {"window_open_internal": "open"}, online=True)
+    assert head.window_open is True
