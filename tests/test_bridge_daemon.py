@@ -456,6 +456,70 @@ def test_publish_fleet_rooms_payload_shape() -> None:
     assert json.loads(hol_pub[-1]) == {"home9": {"active": True}}
 
 
+def _relay(dev_id: str = "relay_1", name: str = "Relais") -> DanfossDevice:
+    return DanfossDevice(id=dev_id, name=name, category="relay", online=True, relay_on=True)
+
+
+def test_publish_fleet_relays_topic() -> None:
+    transport = _MemTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport, base_topic="danfoss2mqtt")  # type: ignore[arg-type]
+    links = {"relay_1": [{"room_id": "77", "name": "Salle 1", "linked": True}]}
+    daemon.publish_fleet([_head(), _relay()], relays=links)
+    pub = [(p, r) for t, p, r in transport.published if t == "danfoss2mqtt/bridge/relays"]
+    assert pub and pub[-1][1] is True  # retained
+    assert json.loads(pub[-1][0]) == links
+    # None leaves the retained topic untouched; an empty dict is published as such.
+    transport.published.clear()
+    daemon.publish_fleet([_head()])
+    assert "danfoss2mqtt/bridge/relays" not in {t for t, _, _ in transport.published}
+    daemon.publish_fleet([_head()], relays={})
+    assert ("danfoss2mqtt/bridge/relays", "{}", True) in transport.published
+
+
+async def test_relay_links_read_sparingly_and_keep_last_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(bridge_daemon.time, "monotonic", lambda: now[0])
+    raw = [
+        {"room_id": 77, "name": "Salle 1", "linked": True},
+        {"room_id": 78, "name": "Salle 2", "linked": False},
+        {"room_id": None, "name": "sans id"},  # dropped
+    ]
+    client = SimpleNamespace(async_relay_rooms=AsyncMock(return_value=raw))
+    links = bridge_daemon.RelayLinks(ttl=3600.0)
+    devices = [_head(), _relay()]
+    expected = {
+        "relay_1": [
+            {"room_id": "77", "name": "Salle 1", "linked": True},
+            {"room_id": "78", "name": "Salle 2", "linked": False},
+        ]
+    }
+    assert await links.read(client, devices) == expected  # type: ignore[arg-type]
+    # Within the TTL: no new cloud request.
+    now[0] += 600
+    assert await links.read(client, devices) == expected  # type: ignore[arg-type]
+    assert client.async_relay_rooms.await_count == 1
+    # After the TTL a failing read keeps the last known rooms, and is retried next cycle.
+    now[0] += 3600
+    client.async_relay_rooms.side_effect = CloudError("boom")
+    assert await links.read(client, devices) == expected  # type: ignore[arg-type]
+    assert await links.read(client, devices) == expected  # type: ignore[arg-type]
+    assert client.async_relay_rooms.await_count == 3
+    # A relay gone from the fleet is dropped; no relay at all publishes an empty topic.
+    assert await links.read(client, [_head()]) == {}  # type: ignore[arg-type]
+
+
+async def test_relay_links_unknown_until_a_first_read_succeeds() -> None:
+    client = SimpleNamespace(async_relay_rooms=AsyncMock(side_effect=CloudError("boom")))
+    links = bridge_daemon.RelayLinks()
+    # Nothing known yet: None leaves bridge/relays untouched rather than publishing "no link".
+    assert await links.read(client, [_relay()]) is None  # type: ignore[arg-type]
+    client.async_relay_rooms.side_effect = None
+    client.async_relay_rooms.return_value = []
+    assert await links.read(client, [_relay()]) == {"relay_1": []}  # type: ignore[arg-type]
+
+
 def test_publish_fleet_omits_room_and_holiday_topics_when_none() -> None:
     transport = _MemTransport()
     daemon = StandaloneDanfoss2MqttDaemon(transport, base_topic="danfoss2mqtt")  # type: ignore[arg-type]
