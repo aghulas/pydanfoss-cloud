@@ -54,7 +54,7 @@ from .mqtt_client import (
 )
 from .rooms import RoomState, aggregate_room
 from .writes import encode_setpoint
-from .z2m_contract import encode_z2m_descriptor, encode_z2m_state
+from .z2m_contract import clean_friendly_name, encode_z2m_descriptor, encode_z2m_state
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -270,6 +270,8 @@ class StandaloneDanfoss2MqttDaemon:
         self._on_bridge_request = on_bridge_request
         self._devices: dict[str, DanfossDevice] = {}
         self._by_friendly: dict[str, DanfossDevice] = {}
+        # dev.id -> its unique friendly name (topic segment), fixed by the last ``publish_fleet``.
+        self._friendly_of: dict[str, str] = {}
         self._by_node: dict[str, DanfossDevice] = {}
         self._local_attrs: dict[str, dict[str, Any]] = {}
         # Cloud-MQTT DP 199 overlay, keyed by dev.id. Opportunistic reads decoded from the push
@@ -316,11 +318,15 @@ class StandaloneDanfoss2MqttDaemon:
         descriptors: list[dict[str, Any]] = []
         self._by_friendly.clear()
         self._by_node.clear()
+        self._friendly_of = unique_friendly_names(
+            [d for d in devices if d.is_head or d.is_sensor or d.is_relay]
+        )
         for dev in devices:
             if dev.node_id:
                 self._by_node[dev.node_id] = dev
             if dev.is_head or dev.is_sensor or dev.is_relay:
                 desc = encode_z2m_descriptor(dev)
+                desc["friendly_name"] = self._friendly_of[dev.id]
                 if device_home and dev.id in device_home:
                     desc.setdefault("danfoss", {})["home_id"] = str(device_home[dev.id])
                 self._by_friendly[desc["friendly_name"]] = dev
@@ -385,8 +391,7 @@ class StandaloneDanfoss2MqttDaemon:
         overlay = self._cloud_overlay.get(dev.id)
         if overlay is not None:
             dev = overlay.apply_to(dev)
-        desc = encode_z2m_descriptor(dev)
-        friendly = desc["friendly_name"]
+        friendly = self._friendly_for(dev)
         self._by_friendly[friendly] = dev
         if dev.node_id:
             self._by_node[dev.node_id] = dev
@@ -404,6 +409,23 @@ class StandaloneDanfoss2MqttDaemon:
             json.dumps(state),
             retain=True,
         )
+
+    def _friendly_for(self, dev: DanfossDevice) -> str:
+        """Topic segment of ``dev``: the unique name fixed by the last ``publish_fleet``.
+
+        A device published on its own before any fleet publish gets its plain name, unless another
+        device already holds it: two devices must never share a topic (one would overwrite the
+        other's state, and a ``/set`` would be routed to the wrong one).
+        """
+        known = self._friendly_of.get(dev.id)
+        if known is not None:
+            return known
+        name = clean_friendly_name(dev.name, dev.id)
+        holder = self._by_friendly.get(name)
+        if holder is not None and holder.id != dev.id:
+            name = _disambiguated(name, dev, set(self._by_friendly))
+        self._friendly_of[dev.id] = name
+        return name
 
     def _merged_local_attrs(
         self, dev_id: str, overlay: HeadOverlay | None
@@ -605,6 +627,45 @@ async def _build_holidays(client: CloudClient) -> dict[str, Any] | None:
         _LOGGER.warning("danfoss2mqtt: could not read holidays this cycle", exc_info=True)
         return None
     return {str(h["gid"]): h for h in items if h.get("gid") is not None}
+
+
+def _disambiguated(name: str, dev: DanfossDevice, taken: set[str]) -> str:
+    """A name for ``dev`` not in ``taken``: ``"<name> (<category>)"``, then with the id's tail."""
+    candidate = f"{name} ({dev.category})"
+    if candidate in taken:
+        candidate = f"{candidate} {dev.id[-4:]}"
+    if candidate in taken:
+        candidate = f"{name} ({dev.id})"
+    return candidate
+
+
+def unique_friendly_names(devices: list[DanfossDevice]) -> dict[str, str]:
+    """``dev.id -> friendly_name``, unique across the fleet (the name is the MQTT topic segment).
+
+    In the Danfoss app a room sensor is usually named after its room, and so is the single head of
+    a one-head room: both then had the same topic, each overwriting the other's retained state, and
+    a ``/set`` was routed to whichever was published last. A name used once is kept as is. When
+    several devices share a name, the head keeps it (its topic is the one that takes writes, and
+    stays stable) and the others get ``"<name> (<category>)"``; devices still colliding (same
+    category) get the tail of their id. The order is deterministic (heads first, then by id), so a
+    name does not move between two polls.
+    """
+    by_name: dict[str, list[DanfossDevice]] = {}
+    for dev in devices:
+        by_name.setdefault(clean_friendly_name(dev.name, dev.id), []).append(dev)
+    out: dict[str, str] = {}
+    taken: set[str] = {name for name, devs in by_name.items() if len(devs) == 1}
+    for name, devs in by_name.items():
+        if len(devs) == 1:
+            out[devs[0].id] = name
+    for name in sorted(n for n, devs in by_name.items() if len(devs) > 1):
+        for i, dev in enumerate(sorted(by_name[name], key=lambda d: (not d.is_head, d.id))):
+            chosen = name if i == 0 and dev.is_head else _disambiguated(name, dev, taken)
+            if chosen in taken:
+                chosen = _disambiguated(name, dev, taken)
+            out[dev.id] = chosen
+            taken.add(chosen)
+    return out
 
 
 # The relay -> room linkage is account configuration, changed by hand in the app and rarely: it is
