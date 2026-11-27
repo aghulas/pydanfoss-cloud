@@ -323,8 +323,9 @@ def test_stage4_schedule_fanout_comfort_setback_r3_and_modes() -> None:
     t2.join(timeout=2.0)
     assert store.get("r1").schedule["comfort"] == 22.0
     assert any(
-        b.get("weekly_schedule", {}).get("dayofweek") == 0x02
+        b.get("weekly_schedule", {}).get("dayofweek") == ["monday"]
         and "mode" not in b["weekly_schedule"]
+        and "num_of_transitions" not in b["weekly_schedule"]
         and b["weekly_schedule"]["transitions"][1]["heat_setpoint"] == 22.0
         for _t, b in tx.sets()
     )
