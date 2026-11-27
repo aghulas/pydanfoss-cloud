@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from pydanfoss_cloud.bridge_daemon import _topic_matches
@@ -666,3 +666,39 @@ def test_config_flags_all_closed_by_default(tmp_path) -> None:
     assert cfg2.enable_holidays is True
     assert cfg2.propagate_window_open is True
     assert cfg2.mode_change_keeps_schedule is True
+
+
+def test_stage5_reconciles_scheduled_setpoint_after_transition_grace() -> None:
+    tx, coord, store, clock = _setup_two_head_room(reconcile_drift=True)
+    store.set_schedule(
+        "r1",
+        {
+            "comfort": 21.0,
+            "setback": 14.0,
+            "days": {"fri": [{"start": "08:30", "end": "18:00"}]},
+        },
+    )
+    store.update_desired("r1", {"mode": "schedule", "comfort": 21.0, "setback": 14.0})
+    tx.inject(
+        "zigbee2mqtt/head_a",
+        {"programming_operation_mode": "schedule", "occupied_heating_setpoint": 21.0},
+    )
+    tx.inject(
+        "zigbee2mqtt/head_b",
+        {"programming_operation_mode": "schedule", "occupied_heating_setpoint": 19.0},
+    )
+    tx.published.clear()
+
+    # Within 3-min transition grace (08:31:00) -> no write yet, view still shows drift
+    grace_wall = datetime(2026, 11, 27, 8, 31, 0, tzinfo=UTC)
+    clock.wall = grace_wall
+    res_grace = coord.tick(now=clock.mono, wall_now=grace_wall)
+    assert res_grace["reconcile_writes"] == 0
+    assert tx.sets() == []
+
+    # Past 3-min grace (09:30:00) -> reconciles head_b with occupied_heating_setpoint_scheduled=21.0
+    late_wall = datetime(2026, 11, 27, 9, 30, 0, tzinfo=UTC)
+    clock.wall = late_wall
+    res_late = coord.tick(now=clock.mono, wall_now=late_wall)
+    assert res_late["reconcile_writes"] == 1
+    assert tx.sets() == [("zigbee2mqtt/head_b/set", {"occupied_heating_setpoint_scheduled": 21.0})]

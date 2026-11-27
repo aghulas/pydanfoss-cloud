@@ -34,6 +34,81 @@ _SIMPLE_DRIFT_ATTRS: dict[str, str] = {
 # and applies its own safe default (``docs/z2m-cloud-parity.md`` §5.7).
 DEFAULT_HEAT_DEMAND_VALID_S = 900
 
+_DAY_KEYS_MON_FIRST: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _hhmm_to_sec(hhmm: str) -> int | None:
+    parts = hhmm.strip().split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    hh, mm = int(parts[0]), int(parts[1])
+    if not (0 <= hh <= 24 and 0 <= mm <= 59):
+        return None
+    return hh * 3600 + mm * 60
+
+
+def expected_scheduled_setpoint(
+    room: CoordinatorRoom, *, now: datetime | None = None
+) -> float | None:
+    """Active comfort/setback target for a ``schedule`` room from ``room.schedule``, or ``None``."""
+    if not room.desired or "setpoint" in room.desired:
+        return None
+    if str(room.desired.get("mode") or "").strip().lower() != "schedule":
+        return None
+    if not isinstance(room.schedule, Mapping):
+        return None
+    days = room.schedule.get("days")
+    if not isinstance(days, Mapping) or not days:
+        return None
+    comfort = room.desired.get("comfort", room.schedule.get("comfort"))
+    setback = room.desired.get("setback", room.schedule.get("setback"))
+    if (
+        isinstance(comfort, bool)
+        or isinstance(setback, bool)
+        or not isinstance(comfort, (int, float))
+        or not isinstance(setback, (int, float))
+    ):
+        return None
+
+    current = now or datetime.now().astimezone()
+    day_key = _DAY_KEYS_MON_FIRST[current.weekday()]
+    cur_hhmm = f"{current.hour:02d}:{current.minute:02d}"
+    windows = days.get(day_key)
+    if isinstance(windows, Sequence):
+        for win in windows:
+            if not isinstance(win, Mapping):
+                continue
+            start = str(win.get("start") or "")
+            end = str(win.get("end") or "")
+            if start and end and start <= cur_hhmm < end:
+                return float(comfort)
+    return float(setback)
+
+
+def within_schedule_transition_grace(
+    room: CoordinatorRoom, *, now: datetime | None = None, grace_s: float = 180.0
+) -> bool:
+    """True when ``now`` is within ``grace_s`` after a scheduled transition of today's day."""
+    if not isinstance(room.schedule, Mapping):
+        return False
+    days = room.schedule.get("days")
+    if not isinstance(days, Mapping) or not days:
+        return False
+    current = now or datetime.now().astimezone()
+    day_key = _DAY_KEYS_MON_FIRST[current.weekday()]
+    windows = days.get(day_key)
+    if not isinstance(windows, Sequence):
+        return False
+    cur_sec = current.hour * 3600 + current.minute * 60 + current.second
+    for win in windows:
+        if not isinstance(win, Mapping):
+            continue
+        for bound in (str(win.get("start") or ""), str(win.get("end") or "")):
+            bound_sec = _hhmm_to_sec(bound)
+            if bound_sec is not None and 0 <= (cur_sec - bound_sec) < grace_s:
+                return True
+    return False
+
 
 def _values_differ(desired: Any, reported: Any) -> bool:
     if reported is None:
@@ -48,7 +123,9 @@ def _values_differ(desired: Any, reported: Any) -> bool:
     return desired != reported
 
 
-def member_drift_keys(room: CoordinatorRoom, dev: DanfossDevice) -> list[str]:
+def member_drift_keys(
+    room: CoordinatorRoom, dev: DanfossDevice, *, now: datetime | None = None
+) -> list[str]:
     """Return the desired keys for which ``dev``'s reported state differs from ``room.desired``."""
     if not room.desired:
         return []
@@ -67,6 +144,11 @@ def member_drift_keys(room: CoordinatorRoom, dev: DanfossDevice) -> list[str]:
         elif dev.mode is not None and dev.mode.strip().lower() != norm_mode:
             drifting.append("mode")
 
+    if "setpoint" not in room.desired:
+        sched_sp = expected_scheduled_setpoint(room, now=now)
+        if sched_sp is not None and _values_differ(sched_sp, dev.setpoint):
+            drifting.append("scheduled_setpoint")
+
     if (
         "preheat" in room.desired
         and str(room.desired.get("mode") or "schedule").strip().lower() == "schedule"
@@ -78,7 +160,9 @@ def member_drift_keys(room: CoordinatorRoom, dev: DanfossDevice) -> list[str]:
     return drifting
 
 
-def _drift_members(room: CoordinatorRoom, members: list[DanfossDevice]) -> list[str]:
+def _drift_members(
+    room: CoordinatorRoom, members: list[DanfossDevice], *, now: datetime | None = None
+) -> list[str]:
     """Member addresses whose reported state differs from ``room.desired`` (empty if no desired)."""
     if not room.desired:
         return []
@@ -86,7 +170,7 @@ def _drift_members(room: CoordinatorRoom, members: list[DanfossDevice]) -> list[
     drifting: list[str] = []
     for addr in room.members:
         dev = by_norm.get(normalize_address(addr))
-        if dev is not None and member_drift_keys(room, dev):
+        if dev is not None and member_drift_keys(room, dev, now=now):
             drifting.append(addr)
     return drifting
 
@@ -97,6 +181,7 @@ def build_room_view(
     sensor: DanfossDevice | None = None,
     *,
     reconcile_blocked: Sequence[str] = (),
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build one ``bridge/rooms`` object for a room from its reported members (+ optional sensor).
 
@@ -143,7 +228,7 @@ def build_room_view(
         "max_setpoint": agg.max_setpoint,
         "schedule": room.schedule,
         "desired": dict(room.desired),
-        "drift": _drift_members(room, members),
+        "drift": _drift_members(room, members, now=now),
         "reconcile_blocked": list(reconcile_blocked),
     }
 

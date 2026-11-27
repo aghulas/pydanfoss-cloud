@@ -317,7 +317,9 @@ class RoomCoordinator:
                     )
                 if self._reconcile_drift:
                     before_blocked = self._reconcile.blocked_members(room)
-                    reconcile_writes.extend(self._reconcile.evaluate_room(room, members, now=mono))
+                    reconcile_writes.extend(
+                        self._reconcile.evaluate_room(room, members, now=mono, wall_now=wall)
+                    )
                     if self._reconcile.blocked_members(room) != before_blocked:
                         blocked_changed = True
                 if self._propagate_window_open:
@@ -501,6 +503,7 @@ class RoomCoordinator:
     def republish(self) -> None:
         """Recompute and publish ``bridge/rooms``, ``bridge/holidays``, ``bridge/heat_demand``."""
         with self._lock:
+            wall_now = self._wall_now()
             rooms = self._store.rooms()
             views: list[dict[str, Any]] = []
             heat_members: dict[str, list[DanfossDevice]] = {}
@@ -514,11 +517,12 @@ class RoomCoordinator:
                         members,
                         sensor,
                         reconcile_blocked=self._reconcile.blocked_members(room),
+                        now=wall_now,
                     )
                 )
                 heat_members[room.room_id] = members
                 names[room.room_id] = room.name
-            holidays_payload = build_holidays_view(self._store.holidays(), now=self._wall_now())
+            holidays_payload = build_holidays_view(self._store.holidays(), now=wall_now)
 
         self._tx.publish(f"{self._base}/bridge/rooms", json.dumps(views), retain=True)
         self._tx.publish(f"{self._base}/bridge/holidays", json.dumps(holidays_payload), retain=True)
@@ -712,6 +716,8 @@ class RoomCoordinator:
         dev: DanfossDevice,
         predicate: Callable[[DanfossDevice], bool],
         mismatch_detail: Callable[[DanfossDevice], str],
+        *,
+        require_fresh: bool = False,
     ) -> tuple[str, str | None]:
         addr = normalize_address(dev.id)
         baseline = self._write_baseline.get(addr, 0)
@@ -719,7 +725,11 @@ class RoomCoordinator:
         with self._state_cv:
             while True:
                 cur = self._fleet.get(addr)
-                if cur is not None and predicate(cur):
+                if (
+                    cur is not None
+                    and (not require_fresh or self._state_seq.get(addr, 0) > baseline)
+                    and predicate(cur)
+                ):
                     return HEAD_APPLIED, None
                 if self._stopping.is_set():
                     return HEAD_UNREACHABLE, "coordinator stopping"
@@ -918,6 +928,7 @@ class RoomCoordinator:
                 lambda cur: (
                     f"reported schedule_active={cur.schedule_active}, wanted {want_schedule_active}"
                 ),
+                require_fresh=True,
             )
 
         heads = run_head_write_loop(
