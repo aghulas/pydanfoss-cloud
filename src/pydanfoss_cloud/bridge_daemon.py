@@ -44,6 +44,12 @@ from .const import (
     WRITE_VERIFIED_PRODUCTS,
 )
 from .decode import DanfossDevice
+from .head_settings import (
+    SETTING_KEYS,
+    HeadSettingsGate,
+    allowed_setting_keys,
+    setting_dps,
+)
 from .keys import async_fetch_gateway_keys
 from .mqtt_client import (
     CloudMqttLink,
@@ -95,6 +101,12 @@ class BridgeConfig:
     # (``cloud_dp199``). OFF by default: it opens a second connection to the user's real Tuya
     # account, and the live path is not yet validated on real hardware. Never publishes.
     cloud_mqtt_listen: bool = False
+    # Write head settings (child lock, window detection, bounds) on proven channels: the room's
+    # group publish for a grouped head, cloud MQTT for an isolated one (``head_settings``). OFF by
+    # default; with ``head_settings_trial_head`` set, only that head (device id) is written — the
+    # supervised first write. Opening it also turns the cloud-MQTT link into a publishing one.
+    head_settings_writes: bool = False
+    head_settings_trial_head: str | None = None
 
     @property
     def has_cloud_credentials(self) -> bool:
@@ -277,10 +289,43 @@ class StandaloneDanfoss2MqttDaemon:
         # Cloud-MQTT DP 199 overlay, keyed by dev.id. Opportunistic reads decoded from the push
         # (``cloud_dp199``), layered on top of the HTTP poll baseline and the local-tunnel attrs.
         self._cloud_overlay: dict[str, HeadOverlay] = {}
+        # Head settings: closed by default (``head_settings``). ``write_link`` is the publishing
+        # cloud-MQTT link (None when there is none: isolated heads then accept no setting), and
+        # ``_grouped`` the heads that belong to a room, from the last ``bridge/rooms`` build.
+        self.head_settings_gate = HeadSettingsGate()
+        self.write_link: CloudMqttLink | None = None
+        self._grouped: set[str] = set()
 
     @property
     def base_topic(self) -> str:
         return self._base
+
+    def is_grouped(self, dev: DanfossDevice) -> bool:
+        """True if ``dev`` belongs to a room (from the last rooms build)."""
+        return dev.id in self._grouped
+
+    def mqtt_ready(self, dev: DanfossDevice) -> bool:
+        """True if the publishing cloud-MQTT link can reach ``dev``'s gateway right now."""
+        link = self.write_link
+        return bool(link and dev.node_id and dev.mesh_id and link.can_publish(dev.mesh_id))
+
+    def allowed_setting_keys(self, dev: DanfossDevice) -> frozenset[str]:
+        """Setting keys ``dev`` accepts on ``/set`` right now (``head_settings``)."""
+        return allowed_setting_keys(
+            dev,
+            gate=self.head_settings_gate,
+            grouped=self.is_grouped(dev),
+            mqtt_ready=self.mqtt_ready(dev),
+        )
+
+    def set_keys_for(self, dev: DanfossDevice) -> list[str]:
+        """``/set`` keys ``dev`` accepts, advertised in ``bridge/devices`` (``danfoss.set_keys``).
+
+        The Companion opens a control only for an advertised key, so a setting the bridge cannot
+        write right now (gate closed, no proven channel) shows as unavailable, never as a switch
+        that silently does nothing.
+        """
+        return sorted({"occupied_heating_setpoint"} | self.allowed_setting_keys(dev))
 
     def start(self) -> None:
         """Announce bridge online and subscribe to ``+/set`` and ``bridge/request/+``."""
@@ -318,6 +363,8 @@ class StandaloneDanfoss2MqttDaemon:
         descriptors: list[dict[str, Any]] = []
         self._by_friendly.clear()
         self._by_node.clear()
+        if rooms is not None:
+            self._grouped = {m for r in rooms for m in r.members}
         self._friendly_of = unique_friendly_names(
             [d for d in devices if d.is_head or d.is_sensor or d.is_relay]
         )
@@ -327,6 +374,8 @@ class StandaloneDanfoss2MqttDaemon:
             if dev.is_head or dev.is_sensor or dev.is_relay:
                 desc = encode_z2m_descriptor(dev)
                 desc["friendly_name"] = self._friendly_of[dev.id]
+                if dev.is_head:
+                    desc.setdefault("danfoss", {})["set_keys"] = self.set_keys_for(dev)
                 if device_home and dev.id in device_home:
                     desc.setdefault("danfoss", {})["home_id"] = str(device_home[dev.id])
                 self._by_friendly[desc["friendly_name"]] = dev
@@ -668,6 +717,95 @@ def unique_friendly_names(devices: list[DanfossDevice]) -> dict[str, str]:
     return out
 
 
+# How long the gateway's echo of a cloud-MQTT setting write is awaited before the per-device read.
+SETTING_CONFIRM_TIMEOUT_S = 15.0
+
+
+async def _mqtt_write_confirmed(
+    link: CloudMqttLink, client: CloudClient, dev: DanfossDevice, dps: dict[int, bool | int]
+) -> str:
+    """Publish ``dps`` to an isolated head over cloud MQTT and confirm it, never optimistically.
+
+    Confirmed by the gateway's echo (inbound report of each DP for that node), else by one read of
+    the head through the per-device cloud route. Returns how it was confirmed ("echo" / "cloud");
+    raises ``CloudWriteError`` when nothing confirms it.
+    """
+    node, gateway = dev.node_id or "", dev.mesh_id or ""
+    waiters = [
+        asyncio.ensure_future(
+            link.await_confirmation(node, dp, value, timeout_s=SETTING_CONFIRM_TIMEOUT_S)
+        )
+        for dp, value in dps.items()
+    ]
+    await asyncio.sleep(0)  # listen before publishing: a fast gateway must not answer unheard
+    try:
+        await link.publish_dp(gateway, node, {str(dp): v for dp, v in dps.items()})
+        echoed = all(await asyncio.gather(*waiters))
+    except Exception as err:  # noqa: BLE001 - any send failure is a refused write, never blind
+        for waiter in waiters:
+            waiter.cancel()
+        raise CloudWriteError(f"cloud-MQTT publish failed: {type(err).__name__}") from err
+    if echoed:
+        return "echo"
+    fresh = await client.async_get_device_dps(dev.id)
+    if fresh and all(fresh.get(str(dp)) == value for dp, value in dps.items()):
+        return "cloud"
+    raise CloudWriteError("not confirmed: no echo from the gateway and the cloud still differs")
+
+
+async def write_head_settings(
+    client: CloudClient,
+    daemon: StandaloneDanfoss2MqttDaemon,
+    dev: DanfossDevice,
+    payload: dict[str, Any],
+) -> tuple[set[str], bool]:
+    """Write the setting keys of a ``/set`` payload on their proven channel (``head_settings``).
+
+    Returns (keys handled here, whether a write was sent). A key the head does not accept right now
+    (gate closed, no channel) is not handled: the caller logs it as unsupported. A refused value or
+    an unconfirmed write is logged and nothing is retried.
+    """
+    asked = {k for k in payload if k in SETTING_KEYS}
+    allowed = daemon.allowed_setting_keys(dev)
+    keys = asked & allowed
+    if not keys:
+        return set(), False
+    try:
+        dps = setting_dps({k: payload[k] for k in keys}, dev)
+    except CloudWriteError as err:
+        _LOGGER.warning("danfoss2mqtt: head setting refused for %s: %s", dev.id, err)
+        return keys, False
+    try:
+        if daemon.is_grouped(dev):
+            resolved = await client.async_resolve_group(dev.id)
+            if resolved is None:
+                raise CloudWriteError("head no longer in a room")
+            group_id, _pid = resolved
+            await client.async_group_publish(group_id, {str(dp): v for dp, v in dps.items()})
+            _LOGGER.info(
+                "danfoss2mqtt: setting DP(s) %s published on room %s (every head of the room; "
+                "applied by the heads within minutes), asked on head %s",
+                sorted(dps),
+                group_id,
+                dev.id,
+            )
+        else:
+            link = daemon.write_link
+            if link is None:
+                raise CloudWriteError("no publishing cloud-MQTT link")
+            how = await _mqtt_write_confirmed(link, client, dev, dps)
+            _LOGGER.info(
+                "danfoss2mqtt: setting DP(s) %s written on head %s over cloud MQTT (confirmed: %s)",
+                sorted(dps),
+                dev.id,
+                how,
+            )
+    except CloudError as err:
+        _LOGGER.warning("danfoss2mqtt: head setting write failed for %s: %s", dev.id, err)
+        return keys, False
+    return keys, True
+
+
 # The relay -> room linkage is account configuration, changed by hand in the app and rarely: it is
 # re-read at most this often (one request per relay), not on every poll cycle.
 RELAY_LINKS_TTL_SECONDS = 3600.0
@@ -727,6 +865,8 @@ async def build_cloud_mqtt_listener(
     config: BridgeConfig,
     client: CloudClient,
     daemon: StandaloneDanfoss2MqttDaemon,
+    *,
+    listen_only: bool = True,
 ) -> CloudMqttLink | None:
     """Build a LISTEN-ONLY cloud-MQTT link whose decoded frames feed the DP 199 overlay.
 
@@ -798,7 +938,7 @@ async def build_cloud_mqtt_listener(
         gateways=refs,
         creds_provider=_fresh_creds,
         on_frame=daemon.on_cloud_frame,
-        listen_only=True,
+        listen_only=listen_only,
     )
 
 
@@ -872,7 +1012,14 @@ async def async_run_bridge(
                 except (CloudError, ValueError) as err:
                     _LOGGER.warning("danfoss2mqtt: setpoint write refused for %s: %s", dev.id, err)
 
-        unsupported = sorted(k for k in payload if k in _CLOUD_UNSUPPORTED_SET_KEYS)
+        handled: set[str] = set()
+        if any(k in SETTING_KEYS for k in payload):
+            handled, written = await write_head_settings(client, daemon, dev, payload)
+            applied = applied or written
+
+        unsupported = sorted(
+            k for k in payload if k in _CLOUD_UNSUPPORTED_SET_KEYS and k not in handled
+        )
         if unsupported:
             _LOGGER.warning(
                 "danfoss2mqtt: /set field(s) %s for %s have no proven Danfoss cloud path from the "
@@ -989,18 +1136,38 @@ async def async_run_bridge(
     )
     daemon.start()
 
+    daemon.head_settings_gate = HeadSettingsGate(
+        enabled=config.head_settings_writes,
+        trial_head=config.head_settings_trial_head or None,
+    )
+    if config.head_settings_writes:
+        _LOGGER.warning(
+            "danfoss2mqtt: head setting writes OPEN (%s): child lock, window detection and bounds "
+            "go out on the room's group publish (grouped heads) or cloud MQTT (isolated heads)",
+            f"trial head {config.head_settings_trial_head} only"
+            if config.head_settings_trial_head
+            else "every head",
+        )
     cloud_link: CloudMqttLink | None = None
-    if config.cloud_mqtt_listen:
+    if config.cloud_mqtt_listen or config.head_settings_writes:
+        # The same link feeds the DP 199 overlay; it publishes only when head setting writes are
+        # open (isolated heads), and stays listen-only otherwise.
+        publishing = config.head_settings_writes
         try:
-            cloud_link = await build_cloud_mqtt_listener(config, client, daemon)
+            cloud_link = await build_cloud_mqtt_listener(
+                config, client, daemon, listen_only=not publishing
+            )
             if cloud_link is not None:
                 await loop.run_in_executor(None, cloud_link.start)
+                if publishing:
+                    daemon.write_link = cloud_link
                 _LOGGER.info(
-                    "danfoss2mqtt: cloud-MQTT DP 199 listener started (listen-only, %d gateway(s))",
+                    "danfoss2mqtt: cloud-MQTT link started (%s, %d gateway(s))",
+                    "publishing for head settings" if publishing else "listen-only",
                     len(cloud_link.gateways),
                 )
         except Exception:  # noqa: BLE001 - a listener failure must never break the poll loop
-            _LOGGER.exception("danfoss2mqtt: cloud-MQTT listener setup failed")
+            _LOGGER.exception("danfoss2mqtt: cloud-MQTT link setup failed")
             cloud_link = None
 
     relay_links = RelayLinks()
@@ -1103,7 +1270,34 @@ def load_bridge_config(
         cloud_mqtt_listen=bool(
             _pick("cloud_mqtt_listen", "cloud_mqtt_listen", "DANFOSS_CLOUD_MQTT_LISTEN", False)
         ),
+        head_settings_writes=_truthy(
+            _pick(
+                "head_settings_writes",
+                "head_settings_writes",
+                "DANFOSS_HEAD_SETTINGS_WRITES",
+                False,
+            )
+        ),
+        head_settings_trial_head=(
+            str(
+                _pick(
+                    "head_settings_trial_head",
+                    "head_settings_trial_head",
+                    "DANFOSS_HEAD_SETTINGS_TRIAL_HEAD",
+                    "",
+                )
+            ).strip()
+            or None
+        ),
     )
+
+
+def _truthy(value: Any) -> bool:
+    """An option read from JSON, the CLI or the environment: a real boolean, or a true-ish string
+    ("1", "true", "yes", "on"). Anything else is False: a write gate never opens by accident."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1136,6 +1330,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="Open a listen-only Tuya cloud-MQTT link so DP 199 pushes feed the read-state overlay",
+    )
+    parser.add_argument(
+        "--head-settings-writes",
+        dest="head_settings_writes",
+        action="store_true",
+        default=None,
+        help="Write head settings (child lock, window detection, bounds) on proven channels",
+    )
+    parser.add_argument(
+        "--head-settings-trial-head",
+        dest="head_settings_trial_head",
+        default=None,
+        help="Confine head setting writes to this one head (device id): supervised first write",
     )
     parser.add_argument(
         "--dry-run",
