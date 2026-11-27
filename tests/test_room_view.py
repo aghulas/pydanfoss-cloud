@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from pydanfoss_cloud.decode import DanfossDevice
 from pydanfoss_cloud.room_store import CoordinatorRoom
-from pydanfoss_cloud.room_view import build_heat_demand, build_room_view
+from pydanfoss_cloud.room_view import (
+    build_heat_demand,
+    build_room_view,
+    expected_scheduled_setpoint,
+    within_schedule_transition_grace,
+)
 
 
 def _head(dev_id: str, **kw) -> DanfossDevice:
@@ -132,3 +139,36 @@ def test_drift_mode_and_preheat_on_z2m_heads() -> None:
         build_room_view(paused_room, [_head("0xA", schedule_active=False, preheat=False)])["drift"]
         == []
     )
+
+
+def test_drift_detects_scheduled_setpoint_mismatch_against_schedule() -> None:
+    room = CoordinatorRoom(
+        room_id="r1",
+        name="Living",
+        prefix="zigbee2mqtt",
+        members=("0xA", "0xB"),
+        schedule={
+            "comfort": 21.0,
+            "setback": 14.0,
+            "days": {"fri": [{"start": "08:30", "end": "18:00"}], "sat": []},
+        },
+        desired={"mode": "schedule", "comfort": 21.0, "setback": 14.0, "preheat": True},
+    )
+    fri_comfort = datetime(2026, 11, 27, 9, 30, tzinfo=UTC)
+    fri_setback = datetime(2026, 11, 27, 19, 0, tzinfo=UTC)
+    fri_grace = datetime(2026, 11, 27, 8, 31, 30, tzinfo=UTC)
+
+    assert expected_scheduled_setpoint(room, now=fri_comfort) == 21.0
+    assert expected_scheduled_setpoint(room, now=fri_setback) == 14.0
+    assert within_schedule_transition_grace(room, now=fri_grace) is True
+    assert within_schedule_transition_grace(room, now=fri_comfort) is False
+
+    view = build_room_view(
+        room,
+        [
+            _head("0xA", schedule_active=True, preheat=True, setpoint=21.0),
+            _head("0xB", schedule_active=True, preheat=True, setpoint=19.0),
+        ],
+        now=fri_comfort,
+    )
+    assert view["drift"] == ["0xB"]

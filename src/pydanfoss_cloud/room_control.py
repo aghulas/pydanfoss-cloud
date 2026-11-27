@@ -19,11 +19,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from .decode import DanfossDevice
 from .room_store import CoordinatorRoom, normalize_address
-from .room_view import member_drift_keys
+from .room_view import (
+    expected_scheduled_setpoint,
+    member_drift_keys,
+    within_schedule_transition_grace,
+)
 from .z2m_contract import encode_z2m_set_command
 
 # Stage 3 — External sensor timing (§3, §5.6)
@@ -292,6 +297,7 @@ class ReconcileTracker:
         members: Sequence[DanfossDevice],
         *,
         now: float,
+        wall_now: datetime | None = None,
     ) -> list[tuple[DanfossDevice, dict[str, Any]]]:
         if not room.desired:
             self.reset_room(room.room_id)
@@ -299,6 +305,7 @@ class ReconcileTracker:
 
         by_norm = {normalize_address(d.id): d for d in members}
         writes: list[tuple[DanfossDevice, dict[str, Any]]] = []
+        in_grace = within_schedule_transition_grace(room, now=wall_now)
 
         for addr in room.members:
             norm = normalize_address(addr)
@@ -306,11 +313,15 @@ class ReconcileTracker:
             if dev is None or not dev.online:
                 continue
 
-            drifts = member_drift_keys(room, dev)
+            drifts = member_drift_keys(room, dev, now=wall_now)
             key = (room.room_id, norm)
             if not drifts:
                 self._states.pop(key, None)
                 continue
+            if in_grace and "scheduled_setpoint" in drifts:
+                drifts = [d for d in drifts if d != "scheduled_setpoint"]
+                if not drifts:
+                    continue
 
             state = self._states.setdefault(key, _HeadReconcileState())
             if state.exhausted:
@@ -324,7 +335,7 @@ class ReconcileTracker:
                 state.exhausted = True
                 continue
 
-            payload = _build_reconcile_payload(room, drifts)
+            payload = _build_reconcile_payload(room, drifts, wall_now=wall_now)
             if not payload:
                 continue
             state.attempts += 1
@@ -334,13 +345,23 @@ class ReconcileTracker:
         return writes
 
 
-def _build_reconcile_payload(room: CoordinatorRoom, drifts: Sequence[str]) -> dict[str, Any]:
+def _build_reconcile_payload(
+    room: CoordinatorRoom,
+    drifts: Sequence[str],
+    *,
+    wall_now: datetime | None = None,
+) -> dict[str, Any]:
     """Build one ``/set`` payload for the drifting keys in ``room.desired``."""
     kwargs: dict[str, Any] = {}
     desired = room.desired
     if "setpoint" in drifts:
         kwargs["setpoint"] = float(desired["setpoint"])
         kwargs["setpoint_scheduled"] = True  # coordinator change (§5.2)
+    elif "scheduled_setpoint" in drifts:
+        sched_sp = expected_scheduled_setpoint(room, now=wall_now)
+        if sched_sp is not None:
+            kwargs["setpoint"] = sched_sp
+            kwargs["setpoint_scheduled"] = True  # coordinator change (§5.2)
     if "child_lock" in drifts:
         kwargs["child_lock"] = bool(desired["child_lock"])
     if "window_detection" in drifts:
