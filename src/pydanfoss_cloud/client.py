@@ -611,6 +611,26 @@ class CloudClient:
                 return room["room_id"]
         return None
 
+    async def async_device_rooms(self, gid: str | int) -> dict[str, str]:
+        """Tuya room (type 4) of each device of a home (m.life.my.group.device.sort.list v2.1).
+
+        Read-only. The app sends this route on every home load (captured 2026-11-28) and places a
+        device in a room from its ``roomId``; validated on real hardware the same day for the room
+        sensors (each one's ``roomId`` is its room in the app, ``-1`` = in no room). Returns
+        {devId: room_id} for the devices (``bizType`` 6) that are in a room; a device in no room
+        (``roomId`` -1, missing or empty) is left out.
+        """
+        r = await self._request("m.life.my.group.device.sort.list", "2.1", {"gid": gid})
+        out: dict[str, str] = {}
+        for x in r if isinstance(r, list) else []:
+            if not isinstance(x, dict) or x.get("bizType") != 6 or not x.get("bizId"):
+                continue
+            room = x.get("roomId")
+            if room in (None, "", -1, "-1"):
+                continue
+            out[str(x["bizId"])] = str(room)
+        return out
+
     async def async_relay_bind(self, dev_id: str, room_id: str | int, linked: bool) -> object:
         """Link / unlink a room to a boiler relay (m.life.solution.wkf.reference.edit, §4.6).
 

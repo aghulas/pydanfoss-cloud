@@ -297,6 +297,7 @@ async def test_async_run_bridge_poll_set_refresh_and_shutdown() -> None:
             "setpoints": {},
             "mode": "at_home",
             "heating": True,
+            "sensor": None,
         }
     ]
     # Fix #2: bridge/holidays is published retained, keyed by home gid

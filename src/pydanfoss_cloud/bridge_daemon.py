@@ -65,7 +65,7 @@ from .relay_links import (
     link_confirmed,
     parse_room_link,
 )
-from .rooms import RoomState, aggregate_room
+from .rooms import RoomState, aggregate_room, attach_room_sensors
 from .writes import encode_setpoint
 from .z2m_contract import clean_friendly_name, encode_z2m_descriptor, encode_z2m_state
 
@@ -443,6 +443,7 @@ class StandaloneDanfoss2MqttDaemon:
                     "setpoints": dict(r.setpoints),
                     "mode": r.mode,
                     "heating": r.heating,
+                    "sensor": r.sensor,
                 }
                 for r in rooms
             ]
@@ -1006,6 +1007,65 @@ async def write_relay_link(
     return True
 
 
+# Which Tuya room each device sits in is account configuration too (rooms are rearranged by hand in
+# the app, rarely): one ``sort.list`` request per home, at most this often.
+DEVICE_ROOMS_TTL_SECONDS = 3600.0
+
+
+class DeviceRooms:
+    """Device -> Tuya room map (``async_device_rooms``), read sparingly, to place room sensors.
+
+    One request per home, at most every ``DEVICE_ROOMS_TTL_SECONDS`` (or at once when a home
+    appears); the homes are those of the last device list (``client.device_list_homes``), so no
+    extra home read. A home whose read fails keeps its previous map and is retried on the next
+    cycle; a home gone from the account is dropped. Read only.
+    """
+
+    def __init__(self, ttl: float = DEVICE_ROOMS_TTL_SECONDS) -> None:
+        self._ttl = ttl
+        self._maps: dict[str, dict[str, str]] = {}
+        self._read_at: dict[str, float] = {}
+        self._conflicts = 0
+
+    async def read(self, client: CloudClient) -> dict[str, str]:
+        """Merged {devId: room_id} of every home known so far ({} when nothing is known)."""
+        raw = getattr(client, "device_list_homes", None)
+        homes = list(raw) if isinstance(raw, dict) else []
+        for gone in set(self._maps) - set(homes):
+            self._maps.pop(gone, None)
+            self._read_at.pop(gone, None)
+        now = time.monotonic()
+        for gid in homes:
+            last = self._read_at.get(gid)
+            if last is not None and now - last < self._ttl:
+                continue
+            try:
+                self._maps[gid] = await client.async_device_rooms(gid)
+            except CloudError:
+                _LOGGER.warning("danfoss2mqtt: could not read a home's device rooms this cycle")
+                continue
+            self._read_at[gid] = now
+        merged: dict[str, str] = {}
+        for device_map in self._maps.values():
+            merged.update(device_map)
+        return merged
+
+    def attach(
+        self, rooms: list[RoomState], devices: list[DanfossDevice], device_rooms: dict[str, str]
+    ) -> list[RoomState]:
+        """``attach_room_sensors``, logging (once per change, no id) groups whose heads disagree."""
+        out, conflicts = attach_room_sensors(rooms, devices, device_rooms)
+        if conflicts != self._conflicts:
+            self._conflicts = conflicts
+            if conflicts:
+                _LOGGER.warning(
+                    "danfoss2mqtt: %d room group(s) have heads in different Tuya rooms; "
+                    "no room sensor is attached to them",
+                    conflicts,
+                )
+        return out
+
+
 async def build_cloud_mqtt_listener(
     config: BridgeConfig,
     client: CloudClient,
@@ -1347,11 +1407,14 @@ async def async_run_bridge(
             _LOGGER.exception("danfoss2mqtt: cloud-MQTT link setup failed")
             cloud_link = None
 
+    device_rooms = DeviceRooms()
     try:
         while not stop.is_set():
             try:
                 devices = await client.async_list_devices()
                 rooms = await _build_rooms(client, devices)
+                if rooms is not None:
+                    rooms = device_rooms.attach(rooms, devices, await device_rooms.read(client))
                 holidays = await _build_holidays(client)
                 relays = await relay_links.read(client, devices)
                 raw_home = getattr(client, "device_home", None)
