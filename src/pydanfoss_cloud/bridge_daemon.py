@@ -58,6 +58,13 @@ from .mqtt_client import (
     _new_paho_client,
     build_credentials,
 )
+from .relay_links import (
+    ROOM_LINK_KEY,
+    RelayLinksGate,
+    check_room_link,
+    link_confirmed,
+    parse_room_link,
+)
 from .rooms import RoomState, aggregate_room
 from .writes import encode_setpoint
 from .z2m_contract import clean_friendly_name, encode_z2m_descriptor, encode_z2m_state
@@ -107,6 +114,12 @@ class BridgeConfig:
     # supervised first write. Opening it also turns the cloud-MQTT link into a publishing one.
     head_settings_writes: bool = False
     head_settings_trial_head: str | None = None
+    # Link / unlink a room to a boiler relay (``room_link`` on the relay's ``/set``,
+    # ``relay_links``). It changes the boiler's heat demand: OFF by default; with
+    # ``relay_links_trial_relay`` set, only that relay (device id) is written — the supervised
+    # first write.
+    relay_links_writes: bool = False
+    relay_links_trial_relay: str | None = None
 
     @property
     def has_cloud_credentials(self) -> bool:
@@ -295,6 +308,11 @@ class StandaloneDanfoss2MqttDaemon:
         self.head_settings_gate = HeadSettingsGate()
         self.write_link: CloudMqttLink | None = None
         self._grouped: set[str] = set()
+        # Relay room linkage writes: closed by default (``relay_links``). ``_relay_rooms`` is the
+        # last linkage published on ``bridge/relays``: a relay is only offered ``room_link`` once
+        # its rooms are known (the Companion lists them before it can change one).
+        self.relay_links_gate = RelayLinksGate()
+        self._relay_rooms: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def base_topic(self) -> str:
@@ -326,6 +344,25 @@ class StandaloneDanfoss2MqttDaemon:
         that silently does nothing.
         """
         return sorted({"occupied_heating_setpoint"} | self.allowed_setting_keys(dev))
+
+    def relay_set_keys_for(self, dev: DanfossDevice) -> list[str]:
+        """``/set`` keys a boiler relay accepts right now, advertised as ``danfoss.set_keys``.
+
+        ``room_link`` while the relay linkage gate is open for it and its rooms are known; else
+        nothing (the relay's own on/off is server-driven, never written).
+        """
+        if self.relay_links_gate.open_for(dev.id) and dev.id in self._relay_rooms:
+            return [ROOM_LINK_KEY]
+        return []
+
+    def publish_relays(self, relays: dict[str, list[dict[str, Any]]]) -> None:
+        """Publish ``bridge/relays`` (retained) and keep it as the known linkage."""
+        self._relay_rooms = {rid: list(rooms) for rid, rooms in relays.items()}
+        self._transport.publish(
+            f"{self._base}/bridge/relays",
+            json.dumps(relays),
+            retain=True,
+        )
 
     def start(self) -> None:
         """Announce bridge online and subscribe to ``+/set`` and ``bridge/request/+``."""
@@ -365,6 +402,8 @@ class StandaloneDanfoss2MqttDaemon:
         self._by_node.clear()
         if rooms is not None:
             self._grouped = {m for r in rooms for m in r.members}
+        if relays is not None:
+            self._relay_rooms = {rid: list(r) for rid, r in relays.items()}
         self._friendly_of = unique_friendly_names(
             [d for d in devices if d.is_head or d.is_sensor or d.is_relay]
         )
@@ -376,6 +415,8 @@ class StandaloneDanfoss2MqttDaemon:
                 desc["friendly_name"] = self._friendly_of[dev.id]
                 if dev.is_head:
                     desc.setdefault("danfoss", {})["set_keys"] = self.set_keys_for(dev)
+                elif dev.is_relay:
+                    desc.setdefault("danfoss", {})["set_keys"] = self.relay_set_keys_for(dev)
                 if device_home and dev.id in device_home:
                     desc.setdefault("danfoss", {})["home_id"] = str(device_home[dev.id])
                 self._by_friendly[desc["friendly_name"]] = dev
@@ -419,11 +460,7 @@ class StandaloneDanfoss2MqttDaemon:
             )
 
         if relays is not None:
-            self._transport.publish(
-                f"{self._base}/bridge/relays",
-                json.dumps(relays),
-                retain=True,
-            )
+            self.publish_relays(relays)
 
         for dev in devices:
             if dev.is_head or dev.is_sensor or dev.is_relay:
@@ -816,13 +853,35 @@ class RelayLinks:
 
     One ``async_relay_rooms`` request per relay, at most every ``RELAY_LINKS_TTL_SECONDS`` (or at
     once when a relay appears). A relay whose read fails keeps its previous rooms and is retried on
-    the next cycle; a relay gone from the fleet is dropped. Read only.
+    the next cycle; a relay gone from the fleet is dropped. ``refresh`` re-reads one relay at once
+    (around a ``room_link`` write), outside the TTL.
     """
 
     def __init__(self, ttl: float = RELAY_LINKS_TTL_SECONDS) -> None:
         self._ttl = ttl
         self._rooms: dict[str, list[dict[str, Any]]] = {}
         self._read_at: dict[str, float] = {}
+
+    async def refresh(self, client: CloudClient, relay_id: str) -> list[dict[str, Any]]:
+        """Read one relay's rooms now and keep them. Raises ``CloudError`` on a failed read (the
+        previous rooms stand)."""
+        rooms = await client.async_relay_rooms(relay_id)
+        clean = [
+            {
+                "room_id": str(r.get("room_id")),
+                "name": r.get("name"),
+                "linked": bool(r.get("linked")),
+            }
+            for r in rooms
+            if isinstance(r, dict) and r.get("room_id") is not None
+        ]
+        self._rooms[relay_id] = clean
+        self._read_at[relay_id] = time.monotonic()
+        return list(clean)
+
+    def snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        """The linkage known now, keyed by relay id (what ``bridge/relays`` carries)."""
+        return {rid: list(rooms) for rid, rooms in self._rooms.items()}
 
     async def read(
         self, client: CloudClient, devices: list[DanfossDevice]
@@ -842,23 +901,109 @@ class RelayLinks:
             if last is not None and now - last < self._ttl:
                 continue
             try:
-                rooms = await client.async_relay_rooms(relay_id)
+                await self.refresh(client, relay_id)
             except CloudError:
                 _LOGGER.warning("danfoss2mqtt: could not read a relay's rooms this cycle")
                 continue
-            self._rooms[relay_id] = [
-                {
-                    "room_id": str(r.get("room_id")),
-                    "name": r.get("name"),
-                    "linked": bool(r.get("linked")),
-                }
-                for r in rooms
-                if isinstance(r, dict) and r.get("room_id") is not None
-            ]
-            self._read_at[relay_id] = now
         if relay_ids and not self._rooms:
             return None
-        return {rid: list(rooms) for rid, rooms in self._rooms.items()}
+        return self.snapshot()
+
+
+# Read-back of a ``room_link`` write: the relay's rooms are re-read up to this many times, this
+# far apart, until the room shows the asked state.
+RELAY_CONFIRM_ATTEMPTS = 3
+RELAY_CONFIRM_DELAY_S = 5.0
+
+
+async def write_relay_link(
+    client: CloudClient,
+    daemon: StandaloneDanfoss2MqttDaemon,
+    links: RelayLinks,
+    dev: DanfossDevice,
+    raw: Any,
+) -> bool:
+    """Link / unlink one room to boiler relay ``dev`` (``room_link`` on its ``/set``).
+
+    Validated against a FRESH read of the relay's rooms (the room must be one it lists; its last
+    linked room is never unlinked), written with ``async_relay_bind`` (one room), then confirmed by
+    re-reading the relay's rooms. Never optimistic: ``bridge/relays`` only ever carries what the
+    cloud read back. Returns True when the relay's rooms were read (the caller republishes
+    ``bridge/relays`` at once), False when nothing was read (refused before any request).
+    """
+    if not dev.is_relay:
+        _LOGGER.warning("danfoss2mqtt: room_link refused for %s: not a boiler relay", dev.id)
+        return False
+    if not daemon.relay_links_gate.open_for(dev.id):
+        _LOGGER.warning(
+            "danfoss2mqtt: room_link refused for relay %s: relay linkage writes are closed "
+            "(add-on option relay_links_writes / relay_links_trial_relay)",
+            dev.id,
+        )
+        return False
+    try:
+        request = parse_room_link(raw)
+    except CloudWriteError as err:
+        _LOGGER.warning("danfoss2mqtt: room_link refused for relay %s: %s", dev.id, err)
+        return False
+    try:
+        rooms = await links.refresh(client, dev.id)
+    except CloudError as err:
+        _LOGGER.warning(
+            "danfoss2mqtt: room_link not sent for relay %s: its rooms could not be read: %s",
+            dev.id,
+            err,
+        )
+        return False
+    try:
+        needed = check_room_link(request, rooms)
+    except CloudWriteError as err:
+        _LOGGER.warning(
+            "danfoss2mqtt: room_link refused for relay %s, room %s: %s",
+            dev.id,
+            request.room_id,
+            err,
+        )
+        return True
+    if not needed:
+        _LOGGER.info(
+            "danfoss2mqtt: room %s already %s relay %s; nothing sent",
+            request.room_id,
+            "linked to" if request.linked else "unlinked from",
+            dev.id,
+        )
+        return True
+    try:
+        await client.async_relay_bind(dev.id, request.room_id, request.linked)
+    except CloudError as err:
+        _LOGGER.warning(
+            "danfoss2mqtt: room_link write failed for relay %s, room %s: %s",
+            dev.id,
+            request.room_id,
+            err,
+        )
+    for attempt in range(RELAY_CONFIRM_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(RELAY_CONFIRM_DELAY_S)
+        try:
+            rooms = await links.refresh(client, dev.id)
+        except CloudError:
+            continue
+        if link_confirmed(request, rooms):
+            _LOGGER.info(
+                "danfoss2mqtt: room %s %s relay %s (confirmed by a read of the relay's rooms)",
+                request.room_id,
+                "linked to" if request.linked else "unlinked from",
+                dev.id,
+            )
+            return True
+    _LOGGER.warning(
+        "danfoss2mqtt: room_link on relay %s, room %s NOT confirmed: the relay's rooms still "
+        "show the previous state (published as read)",
+        dev.id,
+        request.room_id,
+    )
+    return True
 
 
 async def build_cloud_mqtt_listener(
@@ -982,8 +1127,28 @@ async def async_run_bridge(
     refresh_event = asyncio.Event()
     stop = stop_event or asyncio.Event()
     pending_writes: set[asyncio.Task[None]] = set()
+    relay_links = RelayLinks()
+    relay_write_lock = asyncio.Lock()
+
+    async def _apply_room_link(dev: DanfossDevice, raw: Any) -> None:
+        # One relay linkage write at a time: each is read, written and read back on its own.
+        async with relay_write_lock:
+            if await write_relay_link(client, daemon, relay_links, dev, raw):
+                daemon.publish_relays(relay_links.snapshot())
 
     async def _apply_set(dev: DanfossDevice, payload: dict[str, Any]) -> None:
+        if dev.is_relay:
+            if ROOM_LINK_KEY in payload:
+                await _apply_room_link(dev, payload[ROOM_LINK_KEY])
+            other = sorted(k for k in payload if k != ROOM_LINK_KEY)
+            if other:
+                _LOGGER.warning(
+                    "danfoss2mqtt: /set field(s) %s for relay %s ignored: a relay only takes "
+                    "room_link (its on/off is driven by the linked rooms' heat demand)",
+                    other,
+                    dev.id,
+                )
+            return
         applied = False
 
         # Only the room-level setpoint has a proven path 1a from the cloud (group publish +
@@ -1148,6 +1313,18 @@ async def async_run_bridge(
             if config.head_settings_trial_head
             else "every head",
         )
+    daemon.relay_links_gate = RelayLinksGate(
+        enabled=config.relay_links_writes,
+        trial_relay=config.relay_links_trial_relay or None,
+    )
+    if config.relay_links_writes:
+        _LOGGER.warning(
+            "danfoss2mqtt: relay room linkage writes OPEN (%s): room_link changes which rooms "
+            "drive a boiler relay, i.e. the boiler's heat demand",
+            f"trial relay {config.relay_links_trial_relay} only"
+            if config.relay_links_trial_relay
+            else "every relay",
+        )
     cloud_link: CloudMqttLink | None = None
     if config.cloud_mqtt_listen or config.head_settings_writes:
         # The same link feeds the DP 199 overlay; it publishes only when head setting writes are
@@ -1170,7 +1347,6 @@ async def async_run_bridge(
             _LOGGER.exception("danfoss2mqtt: cloud-MQTT link setup failed")
             cloud_link = None
 
-    relay_links = RelayLinks()
     try:
         while not stop.is_set():
             try:
@@ -1289,6 +1465,25 @@ def load_bridge_config(
             ).strip()
             or None
         ),
+        relay_links_writes=_truthy(
+            _pick(
+                "relay_links_writes",
+                "relay_links_writes",
+                "DANFOSS_RELAY_LINKS_WRITES",
+                False,
+            )
+        ),
+        relay_links_trial_relay=(
+            str(
+                _pick(
+                    "relay_links_trial_relay",
+                    "relay_links_trial_relay",
+                    "DANFOSS_RELAY_LINKS_TRIAL_RELAY",
+                    "",
+                )
+            ).strip()
+            or None
+        ),
     )
 
 
@@ -1343,6 +1538,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="head_settings_trial_head",
         default=None,
         help="Confine head setting writes to this one head (device id): supervised first write",
+    )
+    parser.add_argument(
+        "--relay-links-writes",
+        dest="relay_links_writes",
+        action="store_true",
+        default=None,
+        help="Link / unlink rooms to boiler relays (room_link): changes the boiler's heat demand",
+    )
+    parser.add_argument(
+        "--relay-links-trial-relay",
+        dest="relay_links_trial_relay",
+        default=None,
+        help="Confine relay linkage writes to this one relay (device id): supervised first write",
     )
     parser.add_argument(
         "--dry-run",
