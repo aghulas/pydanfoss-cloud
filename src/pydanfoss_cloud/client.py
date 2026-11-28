@@ -651,6 +651,36 @@ class CloudClient:
             },
         )
 
+    async def async_sensor_room_save(self, dev_id: str, room_id: str | int) -> object:
+        """Put a room sensor in a Tuya room (``smartlife.m.custom.wkf.device.relation.save`` v1.0).
+
+        The app's "room" gesture on a sensor, captured 2026-11-28 as
+        ``thing.m.custom.wkf.device.relation.save`` ``{bizId, bizType: 6, parentId, parentType: 4}``
+        (the SDK signs ``thing.m.*`` as ``smartlife.m.*``); the app re-reads
+        ``m.life.my.group.device.sort.list`` right after (``async_device_rooms``). One device, one
+        room: unlike ``async_room_set_devices`` it does not replace the room's member list. It
+        changes what the room's heads regulate on: the bridge's ``sensor_room`` wraps it behind a
+        closed-by-default gate, a fresh read before and a read-back after. Not yet written through
+        the bridge on real hardware (supervised first write pending).
+        """
+        return await self._request(
+            "smartlife.m.custom.wkf.device.relation.save",
+            "1.0",
+            {"bizId": dev_id, "bizType": 6, "parentId": room_id, "parentType": 4},
+        )
+
+    async def async_sensor_room_delete(self, dev_id: str, room_id: str | int) -> object:
+        """Take a room sensor out of its Tuya room (``…device.relation.delete`` v1.0).
+
+        Same capture and keys as ``async_sensor_room_save``; ``room_id`` is the room the sensor
+        is in now (from ``async_device_rooms``). Same gate, same pending first write.
+        """
+        return await self._request(
+            "smartlife.m.custom.wkf.device.relation.delete",
+            "1.0",
+            {"bizId": dev_id, "bizType": 6, "parentId": room_id, "parentType": 4},
+        )
+
     # --- Room management writes (contract §4.7). Validated on real hardware by the MCP connector.
     # These mutate the live account structure (regrouping heads changes shared schedules): a caller
     # must gate them on real-hardware validation and admin rights.
