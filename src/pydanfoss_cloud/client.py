@@ -615,8 +615,10 @@ class CloudClient:
         """Link / unlink a room to a boiler relay (m.life.solution.wkf.reference.edit, §4.6).
 
         ``gwId == devId`` of the relay. ``linked`` True = ``bind`` (the room drives the relay),
-        False = ``unbind``. One room per call. Captured from the app; to validate on real hardware
-        (it changes the boiler's heat demand).
+        False = ``unbind``. One room per call. Captured from the app and used by the MCP connector;
+        the bridge's ``room_link`` (``relay_links``) wraps it behind a closed-by-default gate, a
+        fresh read before and a read-back after. Through the bridge it still awaits its supervised
+        first write (it changes the boiler's heat demand).
         """
         return await self._request(
             "m.life.solution.wkf.reference.edit",
