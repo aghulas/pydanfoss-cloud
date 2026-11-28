@@ -65,7 +65,7 @@ from .relay_links import (
     link_confirmed,
     parse_room_link,
 )
-from .rooms import RoomState, aggregate_room, attach_room_sensors
+from .rooms import RoomState, aggregate_room, attach_room_sensors, isolated_head_sensors
 from .writes import encode_setpoint
 from .z2m_contract import clean_friendly_name, encode_z2m_descriptor, encode_z2m_state
 
@@ -313,6 +313,8 @@ class StandaloneDanfoss2MqttDaemon:
         # its rooms are known (the Companion lists them before it can change one).
         self.relay_links_gate = RelayLinksGate()
         self._relay_rooms: dict[str, list[dict[str, Any]]] = {}
+        # Isolated head -> its Tuya room's sensor (``isolated_head_sensors``), last known.
+        self._head_sensors: dict[str, str] = {}
 
     @property
     def base_topic(self) -> str:
@@ -382,6 +384,7 @@ class StandaloneDanfoss2MqttDaemon:
         holidays: dict[str, Any] | None = None,
         device_home: dict[str, str] | None = None,
         relays: dict[str, list[dict[str, Any]]] | None = None,
+        head_sensors: dict[str, str] | None = None,
     ) -> None:
         """Publish ``bridge/devices``, ``bridge/rooms``, ``bridge/holidays``, ``bridge/relays`` and
         all device states.
@@ -392,6 +395,10 @@ class StandaloneDanfoss2MqttDaemon:
 
         ``relays`` maps a boiler relay's device id to the rooms eligible to drive it,
         ``[{"room_id", "name", "linked"}]`` (the relay's own on/off is on its device topic).
+
+        ``head_sensors`` maps an isolated head (in no schedule group) to the room sensor of its Tuya
+        room (``isolated_head_sensors``), published as ``danfoss.room_sensor`` on the head's entry.
+        ``None`` keeps the last known map (like ``rooms``): one failed group read does not drop it.
         """
         self._devices = {d.id: d for d in devices}
         if local_attrs is not None:
@@ -404,6 +411,8 @@ class StandaloneDanfoss2MqttDaemon:
             self._grouped = {m for r in rooms for m in r.members}
         if relays is not None:
             self._relay_rooms = {rid: list(r) for rid, r in relays.items()}
+        if head_sensors is not None:
+            self._head_sensors = dict(head_sensors)
         self._friendly_of = unique_friendly_names(
             [d for d in devices if d.is_head or d.is_sensor or d.is_relay]
         )
@@ -415,6 +424,9 @@ class StandaloneDanfoss2MqttDaemon:
                 desc["friendly_name"] = self._friendly_of[dev.id]
                 if dev.is_head:
                     desc.setdefault("danfoss", {})["set_keys"] = self.set_keys_for(dev)
+                    sensor_id = self._head_sensors.get(dev.id)
+                    if sensor_id and dev.id not in self._grouped:
+                        desc["danfoss"]["room_sensor"] = sensor_id
                 elif dev.is_relay:
                     desc.setdefault("danfoss", {})["set_keys"] = self.relay_set_keys_for(dev)
                 if device_home and dev.id in device_home:
@@ -1413,8 +1425,11 @@ async def async_run_bridge(
             try:
                 devices = await client.async_list_devices()
                 rooms = await _build_rooms(client, devices)
+                head_sensors: dict[str, str] | None = None
                 if rooms is not None:
-                    rooms = device_rooms.attach(rooms, devices, await device_rooms.read(client))
+                    room_map = await device_rooms.read(client)
+                    rooms = device_rooms.attach(rooms, devices, room_map)
+                    head_sensors = isolated_head_sensors(rooms, devices, room_map)
                 holidays = await _build_holidays(client)
                 relays = await relay_links.read(client, devices)
                 raw_home = getattr(client, "device_home", None)
@@ -1425,6 +1440,7 @@ async def async_run_bridge(
                     holidays=holidays,
                     device_home=dev_home,
                     relays=relays,
+                    head_sensors=head_sensors,
                 )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("danfoss2mqtt: poll cycle failed")
