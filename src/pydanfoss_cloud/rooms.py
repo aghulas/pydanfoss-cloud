@@ -14,7 +14,7 @@ Aggregation used:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .decode import DanfossDevice
 
@@ -51,6 +51,41 @@ class RoomState:
     # own device map to resolve the room's heads.
     home_gid: str | None = None
     members: tuple[str, ...] = ()
+    # The room sensor (014G2480) the account places in this group's Tuya room, or None: see
+    # ``attach_room_sensors``. Published as ``sensor`` on ``bridge/rooms``.
+    sensor: str | None = None
+
+
+def attach_room_sensors(
+    rooms: list[RoomState],
+    devices: list[DanfossDevice],
+    device_rooms: dict[str, str],
+) -> tuple[list[RoomState], int]:
+    """Set each group's ``sensor`` from the account's device -> Tuya room map (``device_rooms``).
+
+    Proven links only, never a name match:
+
+    - a group's Tuya room is the single ``roomId`` shared by ALL its member heads that carry one;
+      no head with a room, or heads in different rooms, gives the group no room (and no sensor);
+    - the group's sensor is the room sensor in that room, only when exactly ONE sensor is there.
+
+    Returns the rooms (new objects, the input is not changed) and the number of groups whose heads
+    disagree on their room, for the caller to log.
+    """
+    sensors_by_room: dict[str, list[str]] = {}
+    for dev in devices:
+        room = device_rooms.get(dev.id)
+        if dev.is_sensor and room:
+            sensors_by_room.setdefault(room, []).append(dev.id)
+    out: list[RoomState] = []
+    conflicts = 0
+    for state in rooms:
+        head_rooms = {device_rooms[m] for m in state.members if m in device_rooms}
+        if len(head_rooms) > 1:
+            conflicts += 1
+        candidates = sensors_by_room.get(next(iter(head_rooms)), []) if len(head_rooms) == 1 else []
+        out.append(replace(state, sensor=candidates[0] if len(candidates) == 1 else None))
+    return out, conflicts
 
 
 def aggregate_room(room: Room, members: list[DanfossDevice]) -> RoomState:
