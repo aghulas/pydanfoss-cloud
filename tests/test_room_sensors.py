@@ -17,7 +17,7 @@ from pydanfoss_cloud import bridge_daemon
 from pydanfoss_cloud.bridge_daemon import DeviceRooms, StandaloneDanfoss2MqttDaemon
 from pydanfoss_cloud.client import CloudClient, CloudError
 from pydanfoss_cloud.decode import DanfossDevice
-from pydanfoss_cloud.rooms import RoomState, attach_room_sensors
+from pydanfoss_cloud.rooms import RoomState, attach_room_sensors, isolated_head_sensors
 
 
 def _head(dev_id: str) -> DanfossDevice:
@@ -208,3 +208,63 @@ def test_bridge_rooms_carries_sensor() -> None:
     pub = [p for t, p, _r in transport.published if t == "danfoss2mqtt/bridge/rooms"]
     payload = json.loads(pub[-1])
     assert [r["sensor"] for r in payload] == ["s1", None]
+
+
+# --- isolated heads (no schedule group) -----------------------------------------------------------
+
+
+def test_isolated_head_gets_the_sensor_of_its_room() -> None:
+    devices = [_head("h1"), _head("h2"), _sensor("s1"), _head("h9"), _sensor("s9")]
+    device_rooms = {"h1": "401", "h2": "401", "s1": "401", "h9": "409", "s9": "409"}
+    groups = [_group("g1", "h1", "h2")]
+    assert isolated_head_sensors(groups, devices, device_rooms) == {"h9": "s9"}
+
+
+def test_isolated_head_ambiguous_cases_give_no_link() -> None:
+    # Two isolated heads in one room.
+    devices = [_head("h8"), _head("h9"), _sensor("s9")]
+    assert isolated_head_sensors([], devices, {"h8": "409", "h9": "409", "s9": "409"}) == {}
+    # Two sensors in the room.
+    devices = [_head("h9"), _sensor("s8"), _sensor("s9")]
+    assert isolated_head_sensors([], devices, {"h9": "409", "s8": "409", "s9": "409"}) == {}
+    # A grouped head shares the room: the room is the group's, not the isolated head's.
+    devices = [_head("h1"), _head("h9"), _sensor("s9")]
+    groups = [_group("g1", "h1")]
+    assert isolated_head_sensors(groups, devices, {"h1": "409", "h9": "409", "s9": "409"}) == {}
+    # No room for the head, or no sensor in its room.
+    devices = [_head("h9"), _sensor("s9")]
+    assert isolated_head_sensors([], devices, {"s9": "409"}) == {}
+    assert isolated_head_sensors([], devices, {"h9": "409", "s9": "410"}) == {}
+
+
+def test_isolated_head_no_name_fallback() -> None:
+    devices = [
+        DanfossDevice(id="h9", name="Office", category="head"),
+        DanfossDevice(id="s9", name="Office", category="sensor"),
+    ]
+    assert isolated_head_sensors([], devices, {"h9": "409"}) == {}
+
+
+def _descriptors(transport: _MemTransport) -> dict[str, dict[str, Any]]:
+    pub = [p for t, p, _r in transport.published if t == "danfoss2mqtt/bridge/devices"]
+    return {d["danfoss"]["dev_id"]: d for d in json.loads(pub[-1])}
+
+
+def test_bridge_devices_carries_room_sensor_on_isolated_head() -> None:
+    transport = _MemTransport()
+    daemon = StandaloneDanfoss2MqttDaemon(transport, base_topic="danfoss2mqtt")  # type: ignore[arg-type]
+    devices = [_head("h1"), _head("h9"), _sensor("s9")]
+    groups = [_group("g1", "h1")]
+    daemon.publish_fleet(devices, rooms=groups, head_sensors={"h9": "s9"})
+    descs = _descriptors(transport)
+    assert descs["h9"]["danfoss"]["room_sensor"] == "s9"
+    assert "room_sensor" not in descs["h1"]["danfoss"]
+    assert "room_sensor" not in descs["s9"]["danfoss"]
+    # ``None`` keeps the last known map; a head that joined a group loses the link.
+    daemon.publish_fleet(devices, rooms=[_group("g1", "h1", "h9")])
+    assert "room_sensor" not in _descriptors(transport)["h9"]["danfoss"]
+    daemon.publish_fleet(devices, rooms=groups)
+    assert _descriptors(transport)["h9"]["danfoss"]["room_sensor"] == "s9"
+    # An empty map clears it.
+    daemon.publish_fleet(devices, rooms=groups, head_sensors={})
+    assert "room_sensor" not in _descriptors(transport)["h9"]["danfoss"]

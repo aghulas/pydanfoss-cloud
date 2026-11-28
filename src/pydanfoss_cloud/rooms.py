@@ -88,6 +88,45 @@ def attach_room_sensors(
     return out, conflicts
 
 
+def isolated_head_sensors(
+    rooms: list[RoomState],
+    devices: list[DanfossDevice],
+    device_rooms: dict[str, str],
+) -> dict[str, str]:
+    """Room sensor of each ISOLATED head (in no schedule group), from the same Tuya room map.
+
+    A Tuya room whose only head is isolated has no schedule group, so ``attach_room_sensors`` cannot
+    place its sensor. Proven links only, never a name match: the head gets the sensor when, in the
+    head's Tuya ``roomId``,
+
+    - it is the ONLY isolated head;
+    - no head of any schedule group sits there (that room belongs to the group);
+    - exactly ONE room sensor sits there.
+
+    Any ambiguity (two sensors, two isolated heads, a grouped head in the room, no room) gives no
+    link. Returns {head_id: sensor_id}, published as ``danfoss.room_sensor`` on the head's
+    ``bridge/devices`` entry.
+    """
+    grouped = {m for r in rooms for m in r.members}
+    group_rooms = {device_rooms[m] for m in grouped if m in device_rooms}
+    heads_by_room: dict[str, list[str]] = {}
+    sensors_by_room: dict[str, list[str]] = {}
+    for dev in devices:
+        room = device_rooms.get(dev.id)
+        if not room:
+            continue
+        if dev.is_sensor:
+            sensors_by_room.setdefault(room, []).append(dev.id)
+        elif dev.is_head and dev.id not in grouped:
+            heads_by_room.setdefault(room, []).append(dev.id)
+    out: dict[str, str] = {}
+    for room, heads in heads_by_room.items():
+        sensors = sensors_by_room.get(room, [])
+        if len(heads) == 1 and len(sensors) == 1 and room not in group_rooms:
+            out[heads[0]] = sensors[0]
+    return out
+
+
 def aggregate_room(room: Room, members: list[DanfossDevice]) -> RoomState:
     """Build the aggregated state of a room from its present member heads."""
     online = [m for m in members if m.online]
