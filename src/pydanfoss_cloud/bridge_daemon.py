@@ -66,6 +66,12 @@ from .relay_links import (
     parse_room_link,
 )
 from .rooms import RoomState, aggregate_room, attach_room_sensors, isolated_head_sensors
+from .sensor_rooms import (
+    SENSOR_ROOM_KEY,
+    SensorRooms,
+    SensorRoomsGate,
+    write_sensor_room,
+)
 from .writes import encode_setpoint
 from .z2m_contract import clean_friendly_name, encode_z2m_descriptor, encode_z2m_state
 
@@ -120,6 +126,12 @@ class BridgeConfig:
     # first write.
     relay_links_writes: bool = False
     relay_links_trial_relay: str | None = None
+    # Put a room sensor in a Tuya room / take it out (``sensor_room`` on the sensor's ``/set``,
+    # ``sensor_rooms``). It changes what the room's heads regulate on: OFF by default; with
+    # ``sensor_rooms_trial_sensor`` set, only that sensor (device id) is written — the supervised
+    # first write.
+    sensor_rooms_writes: bool = False
+    sensor_rooms_trial_sensor: str | None = None
 
     @property
     def has_cloud_credentials(self) -> bool:
@@ -315,6 +327,11 @@ class StandaloneDanfoss2MqttDaemon:
         self._relay_rooms: dict[str, list[dict[str, Any]]] = {}
         # Isolated head -> its Tuya room's sensor (``isolated_head_sensors``), last known.
         self._head_sensors: dict[str, str] = {}
+        # Sensor room writes: closed by default (``sensor_rooms``). ``_sensor_rooms`` is the last
+        # ``bridge/sensor_rooms`` payload: a sensor is only offered ``sensor_room`` once its room
+        # and its home's rooms are known.
+        self.sensor_rooms_gate = SensorRoomsGate()
+        self._sensor_rooms: dict[str, dict[str, Any]] = {}
 
     @property
     def base_topic(self) -> str:
@@ -356,6 +373,25 @@ class StandaloneDanfoss2MqttDaemon:
         if self.relay_links_gate.open_for(dev.id) and dev.id in self._relay_rooms:
             return [ROOM_LINK_KEY]
         return []
+
+    def sensor_set_keys_for(self, dev: DanfossDevice) -> list[str]:
+        """``/set`` keys a room sensor accepts right now, advertised as ``danfoss.set_keys``.
+
+        ``sensor_room`` while the sensor room gate is open for it and its entry is known on
+        ``bridge/sensor_rooms``; else nothing (a sensor only measures).
+        """
+        if self.sensor_rooms_gate.open_for(dev.id) and dev.id in self._sensor_rooms:
+            return [SENSOR_ROOM_KEY]
+        return []
+
+    def publish_sensor_rooms(self, sensor_rooms: dict[str, dict[str, Any]]) -> None:
+        """Publish ``bridge/sensor_rooms`` (retained) and keep it as the known sensor rooms."""
+        self._sensor_rooms = {sid: dict(entry) for sid, entry in sensor_rooms.items()}
+        self._transport.publish(
+            f"{self._base}/bridge/sensor_rooms",
+            json.dumps(sensor_rooms),
+            retain=True,
+        )
 
     def publish_relays(self, relays: dict[str, list[dict[str, Any]]]) -> None:
         """Publish ``bridge/relays`` (retained) and keep it as the known linkage."""
@@ -429,6 +465,8 @@ class StandaloneDanfoss2MqttDaemon:
                         desc["danfoss"]["room_sensor"] = sensor_id
                 elif dev.is_relay:
                     desc.setdefault("danfoss", {})["set_keys"] = self.relay_set_keys_for(dev)
+                elif dev.is_sensor:
+                    desc.setdefault("danfoss", {})["set_keys"] = self.sensor_set_keys_for(dev)
                 if device_home and dev.id in device_home:
                     desc.setdefault("danfoss", {})["home_id"] = str(device_home[dev.id])
                 self._by_friendly[desc["friendly_name"]] = dev
@@ -1057,10 +1095,19 @@ class DeviceRooms:
                 _LOGGER.warning("danfoss2mqtt: could not read a home's device rooms this cycle")
                 continue
             self._read_at[gid] = now
+        return self.merged()
+
+    def merged(self) -> dict[str, str]:
+        """{devId: room_id} of every home known so far."""
         merged: dict[str, str] = {}
         for device_map in self._maps.values():
             merged.update(device_map)
         return merged
+
+    def store(self, gid: str, device_map: dict[str, str]) -> None:
+        """Keep a home's map read elsewhere (a ``sensor_room`` read-back) as its fresh read."""
+        self._maps[gid] = dict(device_map)
+        self._read_at[gid] = time.monotonic()
 
     def attach(
         self, rooms: list[RoomState], devices: list[DanfossDevice], device_rooms: dict[str, str]
@@ -1201,6 +1248,27 @@ async def async_run_bridge(
     pending_writes: set[asyncio.Task[None]] = set()
     relay_links = RelayLinks()
     relay_write_lock = asyncio.Lock()
+    device_rooms = DeviceRooms()
+    sensor_rooms = SensorRooms()
+    sensor_write_lock = asyncio.Lock()
+    fleet: list[DanfossDevice] = []
+
+    async def _apply_sensor_room(dev: DanfossDevice, raw: Any) -> None:
+        # One sensor room write at a time: each is read, written and read back on its own.
+        async with sensor_write_lock:
+            sensor_ids = [d.id for d in fleet if d.is_sensor]
+            read = await write_sensor_room(
+                client, daemon.sensor_rooms_gate, sensor_rooms, dev, raw, sensor_ids
+            )
+            if read is None:
+                return
+            home_id, home_map = read
+            device_rooms.store(home_id, home_map)
+            payload = await sensor_rooms.read(client, fleet, device_rooms.merged())
+            if payload is not None:
+                daemon.publish_sensor_rooms(payload)
+            # bridge/rooms' ``sensor`` follows at once (next cycle re-attaches from the map).
+            refresh_event.set()
 
     async def _apply_room_link(dev: DanfossDevice, raw: Any) -> None:
         # One relay linkage write at a time: each is read, written and read back on its own.
@@ -1209,6 +1277,18 @@ async def async_run_bridge(
                 daemon.publish_relays(relay_links.snapshot())
 
     async def _apply_set(dev: DanfossDevice, payload: dict[str, Any]) -> None:
+        if dev.is_sensor:
+            if SENSOR_ROOM_KEY in payload:
+                await _apply_sensor_room(dev, payload[SENSOR_ROOM_KEY])
+            other = sorted(k for k in payload if k != SENSOR_ROOM_KEY)
+            if other:
+                _LOGGER.warning(
+                    "danfoss2mqtt: /set field(s) %s for sensor %s ignored: a room sensor only "
+                    "takes sensor_room",
+                    other,
+                    dev.id,
+                )
+            return
         if dev.is_relay:
             if ROOM_LINK_KEY in payload:
                 await _apply_room_link(dev, payload[ROOM_LINK_KEY])
@@ -1397,6 +1477,18 @@ async def async_run_bridge(
             if config.relay_links_trial_relay
             else "every relay",
         )
+    daemon.sensor_rooms_gate = SensorRoomsGate(
+        enabled=config.sensor_rooms_writes,
+        trial_sensor=config.sensor_rooms_trial_sensor or None,
+    )
+    if config.sensor_rooms_writes:
+        _LOGGER.warning(
+            "danfoss2mqtt: sensor room writes OPEN (%s): sensor_room puts a room sensor in a "
+            "room or takes it out, i.e. what the room's heads regulate on",
+            f"trial sensor {config.sensor_rooms_trial_sensor} only"
+            if config.sensor_rooms_trial_sensor
+            else "every sensor",
+        )
     cloud_link: CloudMqttLink | None = None
     if config.cloud_mqtt_listen or config.head_settings_writes:
         # The same link feeds the DP 199 overlay; it publishes only when head setting writes are
@@ -1419,17 +1511,20 @@ async def async_run_bridge(
             _LOGGER.exception("danfoss2mqtt: cloud-MQTT link setup failed")
             cloud_link = None
 
-    device_rooms = DeviceRooms()
     try:
         while not stop.is_set():
             try:
                 devices = await client.async_list_devices()
+                fleet[:] = devices
                 rooms = await _build_rooms(client, devices)
                 head_sensors: dict[str, str] | None = None
+                dev_room_map = await device_rooms.read(client)
                 if rooms is not None:
-                    room_map = await device_rooms.read(client)
-                    rooms = device_rooms.attach(rooms, devices, room_map)
-                    head_sensors = isolated_head_sensors(rooms, devices, room_map)
+                    rooms = device_rooms.attach(rooms, devices, dev_room_map)
+                    head_sensors = isolated_head_sensors(rooms, devices, dev_room_map)
+                sensor_payload = await sensor_rooms.read(client, devices, dev_room_map)
+                if sensor_payload is not None:
+                    daemon.publish_sensor_rooms(sensor_payload)
                 holidays = await _build_holidays(client)
                 relays = await relay_links.read(client, devices)
                 raw_home = getattr(client, "device_home", None)
@@ -1563,6 +1658,25 @@ def load_bridge_config(
             ).strip()
             or None
         ),
+        sensor_rooms_writes=_truthy(
+            _pick(
+                "sensor_rooms_writes",
+                "sensor_rooms_writes",
+                "DANFOSS_SENSOR_ROOMS_WRITES",
+                False,
+            )
+        ),
+        sensor_rooms_trial_sensor=(
+            str(
+                _pick(
+                    "sensor_rooms_trial_sensor",
+                    "sensor_rooms_trial_sensor",
+                    "DANFOSS_SENSOR_ROOMS_TRIAL_SENSOR",
+                    "",
+                )
+            ).strip()
+            or None
+        ),
     )
 
 
@@ -1630,6 +1744,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="relay_links_trial_relay",
         default=None,
         help="Confine relay linkage writes to this one relay (device id): supervised first write",
+    )
+    parser.add_argument(
+        "--sensor-rooms-writes",
+        dest="sensor_rooms_writes",
+        action="store_true",
+        default=None,
+        help="Put room sensors in rooms / take them out (sensor_room): changes what the room's "
+        "heads regulate on",
+    )
+    parser.add_argument(
+        "--sensor-rooms-trial-sensor",
+        dest="sensor_rooms_trial_sensor",
+        default=None,
+        help="Confine sensor room writes to this one sensor (device id): supervised first write",
     )
     parser.add_argument(
         "--dry-run",
